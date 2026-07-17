@@ -8,7 +8,6 @@
 #include <string>
 #include <sstream>
 #include <cmath>
-#include <arm_sme.h>
 #include <omp.h>
 
 #include "Tensor.h"
@@ -61,7 +60,7 @@ inline void ref_bf16_paged_mqa_logits(
                 int64_t kv_offset = ((block_idx * block_size + t)) * dim;
                 for (int64_t d_idx = 0; d_idx < dim; ++d_idx) {
                     k_buffer[global_t * dim + d_idx] =
-                        to_float(kv_cache.data_ptr())[kv_offset + d_idx];
+                        to_float(kv_cache.data_ptr()[kv_offset + d_idx]);
                 }
             }
         }
@@ -74,7 +73,7 @@ inline void ref_bf16_paged_mqa_logits(
                 std::vector<float> q_vec(dim);
                 int64_t q_offset = ((batch_idx * next_n + n) * num_heads + h) * dim;
                 for (int64_t d_idx = 0; d_idx < dim; ++d_idx) {
-                    q_vec[d_idx] = to_float(q.data_ptr())[q_offset + d_idx];
+                    q_vec[d_idx] = to_float(q.data_ptr()[q_offset + d_idx]);
                 }
 
                 // 5. scores mask

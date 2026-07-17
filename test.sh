@@ -1,0 +1,3 @@
+#!/bin/bash
+NUM_THREADS=32
+OMP_NUM_THREADS=$NUM_THREADS OMP_PROC_BIND=close taskset -c 1-$NUM_THREADS ./main

@@ -85,12 +85,31 @@ inline void indexer_bf16_paged_mqa_logits(
                     const bfloat16_t *q_head = q_row + h * dim;
                     const float weight = row_weights[h];
 
+#ifdef __aarch64__
+                    // Load this head's fixed 128-element query once, then reuse
+                    // the four registers for every token in the current page.
+                    const svbool_t pg16 = svptrue_b16();
+                    const svbool_t pg32 = svptrue_b32();
+                    const svbfloat16_t q0 = svld1_bf16(pg16, q_head);
+                    const svbfloat16_t q1 = svld1_bf16(pg16, q_head + 32);
+                    const svbfloat16_t q2 = svld1_bf16(pg16, q_head + 64);
+                    const svbfloat16_t q3 = svld1_bf16(pg16, q_head + 96);
+#endif
                     for (int64_t t = 0; t < valid_tokens; ++t) {
                         const bfloat16_t *k_token = k_page + t * dim;
+#ifdef __aarch64__
+                        svfloat32_t acc = svdup_f32(0.0f);
+                        acc = svbfdot_f32(acc, q0, svld1_bf16(pg16, k_token));
+                        acc = svbfdot_f32(acc, q1, svld1_bf16(pg16, k_token + 32));
+                        acc = svbfdot_f32(acc, q2, svld1_bf16(pg16, k_token + 64));
+                        acc = svbfdot_f32(acc, q3, svld1_bf16(pg16, k_token + 96));
+                        const float dot = svaddv_f32(pg32, acc);
+#else
                         float dot = 0.0f;
                         for (int64_t d = 0; d < dim; ++d) {
                             dot += to_float(q_head[d]) * to_float(k_token[d]);
                         }
+#endif
                         page_output[t] += std::max(0.0f, dot) * weight;
                     }
                 }

@@ -88,7 +88,7 @@ void run_test(const TestCaseParams &p, int64_t rand_seed = 0)
         double avg_time_usage_us = total_time_usage_us / (p.num_runs - 1);
 
         std::cout << std::fixed << std::setprecision(6);
-        std::cout << "Performance: " << (flops / avg_time_usage_us) / (1e12 / 1e6) << " TFLOPS" << std::endl;
+        std::cout << "Performance: " << (flops / avg_time_usage_us) / (1e3) << " GFLOPS" << std::endl;
     }
 }
 

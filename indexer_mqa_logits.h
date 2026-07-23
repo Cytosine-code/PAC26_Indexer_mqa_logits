@@ -31,14 +31,8 @@ inline void indexer_bf16_paged_mqa_logits(
     int64_t block_size,
     int64_t max_model_len
 ) {
-#ifdef __aarch64__
-    // === ARM SME / SVE2 optimized implementation (TODO) ===
-    // TODO: replace with hand-tuned SME outer-product + SVE2 vectorized kernel
+    // 当前是直接调用，优化时应该直接改为实际的内容
     ref_bf16_paged_mqa_logits<float>(q, kv_cache, block_tables, context_lens,
         weights, output, batch_size, next_n, num_heads, dim, block_size, max_model_len);
-#else
-    // === x86 fallback: reference implementation for offline correctness debugging ===
-    ref_bf16_paged_mqa_logits<float>(q, kv_cache, block_tables, context_lens,
-        weights, output, batch_size, next_n, num_heads, dim, block_size, max_model_len);
-#endif
+
 }

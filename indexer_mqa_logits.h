@@ -17,6 +17,70 @@
 #include <arm_sme.h>
 #endif
 
+#ifdef __aarch64__
+extern "C" void pac_sme_page_scores(
+    const bfloat16_t *packed_q, const bfloat16_t *packed_k,
+    float *scores, int64_t token_tiles);
+
+asm(R"(
+    .arch armv9-a+sme+sve2
+    .text
+    .align 4
+    .global pac_sme_page_scores
+    .type pac_sme_page_scores, %function
+pac_sme_page_scores:
+    smstart
+    ptrue p0.h
+    ptrue p1.h
+    ptrue p2.s
+    mov x7, x2
+
+1:
+    zero {za}
+    mov x4, x0
+    mov x5, x1
+    mov x6, #64
+
+2:
+    ld1h {z0.h}, p1/z, [x4]
+    ld1h {z1.h}, p1/z, [x4, #1, mul vl]
+    ld1h {z2.h}, p1/z, [x4, #2, mul vl]
+    ld1h {z3.h}, p1/z, [x4, #3, mul vl]
+    ld1h {z4.h}, p1/z, [x5]
+    bfmopa za0.s, p0/m, p0/m, z0.h, z4.h
+    bfmopa za1.s, p0/m, p0/m, z1.h, z4.h
+    bfmopa za2.s, p0/m, p0/m, z2.h, z4.h
+    bfmopa za3.s, p0/m, p0/m, z3.h, z4.h
+    add x4, x4, #256
+    add x5, x5, #64
+    subs x6, x6, #1
+    b.ne 2b
+
+    mov w12, #0
+    mov x8, x7
+3:
+    add x9, x8, #1, lsl #12
+    add x10, x8, #2, lsl #12
+    add x11, x8, #3, lsl #12
+    st1w {za0h.s[w12, 0]}, p2, [x8]
+    st1w {za1h.s[w12, 0]}, p2, [x9]
+    st1w {za2h.s[w12, 0]}, p2, [x10]
+    st1w {za3h.s[w12, 0]}, p2, [x11]
+    add x8, x8, #256
+    add w12, w12, #1
+    cmp w12, #16
+    b.lo 3b
+
+    add x1, x1, #1, lsl #12
+    add x7, x7, #64
+    subs x3, x3, #1
+    b.ne 1b
+    smstop
+    ret
+    .size pac_sme_page_scores, .-pac_sme_page_scores
+)");
+#endif
+
 inline void indexer_bf16_paged_mqa_logits(
     const Tensor<bfloat16_t, 4> &q,          // [batch_size, next_n, num_heads, dim]
     const Tensor<bfloat16_t, 4> &kv_cache,   // [num_blocks, block_size, 1, dim]
@@ -39,15 +103,94 @@ inline void indexer_bf16_paged_mqa_logits(
     auto *output_ptr = output.data_ptr();
     const int64_t max_num_blocks = block_tables.size(1);
 
-    // The contest shapes use 64-token pages. Keeping one page of partial
-    // results on the stack avoids a context-length-sized temporary buffer.
-    FLASH_ASSERT(block_size <= 64);
+    FLASH_ASSERT(block_size == 64 && num_heads == 64 && dim == 128);
+    FLASH_ASSERT(next_n > 0 && next_n <= 2);
 
 #pragma omp parallel for schedule(static)
     for (int64_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
         const int64_t context_len = context_len_ptr[batch_idx];
         const int64_t num_blocks = ceil_div(context_len, block_size);
 
+#ifdef __aarch64__
+        alignas(64) bfloat16_t packed_q[2][64 * 128];
+        alignas(64) bfloat16_t packed_k[64 * 128];
+        alignas(64) float page_scores[64 * 64];
+
+        for (int64_t n = 0; n < next_n; ++n) {
+            const int64_t row = batch_idx * next_n + n;
+            const bfloat16_t *q_row = q_ptr + row * num_heads * dim;
+            for (int64_t kp = 0; kp < 64; ++kp) {
+                for (int64_t hb = 0; hb < 4; ++hb) {
+                    bfloat16_t *dst = packed_q[n] + (kp * 4 + hb) * 32;
+                    for (int64_t h = 0; h < 16; ++h) {
+                        const bfloat16_t *src =
+                            q_row + (hb * 16 + h) * dim + kp * 2;
+                        dst[h * 2] = src[0];
+                        dst[h * 2 + 1] = src[1];
+                    }
+                }
+            }
+            float *out = output_ptr + row * max_model_len;
+            std::fill(out, out + max_model_len, -INFINITY);
+        }
+
+        for (int64_t logical_block = 0; logical_block < num_blocks; ++logical_block) {
+            const int64_t physical_block =
+                block_table_ptr[batch_idx * max_num_blocks + logical_block];
+            if (physical_block < 0) {
+                continue;
+            }
+            const bfloat16_t *k_page =
+                kv_ptr + physical_block * block_size * dim;
+
+            for (int64_t tb = 0; tb < 4; ++tb) {
+                for (int64_t kp = 0; kp < 64; ++kp) {
+                    bfloat16_t *dst = packed_k + (tb * 64 + kp) * 32;
+                    for (int64_t t = 0; t < 16; ++t) {
+                        const bfloat16_t *src =
+                            k_page + (tb * 16 + t) * dim + kp * 2;
+                        dst[t * 2] = src[0];
+                        dst[t * 2 + 1] = src[1];
+                    }
+                }
+            }
+
+            for (int64_t n = 0; n < next_n; ++n) {
+                const int64_t row = batch_idx * next_n + n;
+                const int64_t q_limit = context_len - next_n + n;
+                const int64_t token_base = logical_block * block_size;
+                const int64_t valid_tokens =
+                    std::min<int64_t>(block_size, q_limit + 1 - token_base);
+                if (valid_tokens <= 0) {
+                    continue;
+                }
+                const int64_t token_tiles = ceil_div(valid_tokens, int64_t(16));
+                pac_sme_page_scores(
+                    packed_q[n], packed_k, page_scores, token_tiles);
+
+                const float *row_weights = weight_ptr + row * num_heads;
+                float *out = output_ptr + row * max_model_len + token_base;
+                const svbool_t all = svptrue_b32();
+                const svfloat32_t zero = svdup_f32(0.0f);
+                for (int64_t tb = 0; tb < token_tiles; ++tb) {
+                    svfloat32_t result = zero;
+                    for (int64_t h = 0; h < 64; ++h) {
+                        const svfloat32_t score = svld1_f32(
+                            all, page_scores + h * 64 + tb * 16);
+                        const svfloat32_t activated =
+                            svmax_f32_x(all, score, zero);
+                        result = svmla_n_f32_x(
+                            all, result, activated, row_weights[h]);
+                    }
+                    const int64_t tile_valid =
+                        std::min<int64_t>(16, valid_tokens - tb * 16);
+                    const svbool_t store_pg =
+                        svwhilelt_b32(uint64_t(0), uint64_t(tile_valid));
+                    svst1_f32(store_pg, out + tb * 16, result);
+                }
+            }
+        }
+#else
         for (int64_t n = 0; n < next_n; ++n) {
             const int64_t row = batch_idx * next_n + n;
             const int64_t q_limit = context_len - next_n + n;
@@ -85,31 +228,12 @@ inline void indexer_bf16_paged_mqa_logits(
                     const bfloat16_t *q_head = q_row + h * dim;
                     const float weight = row_weights[h];
 
-#ifdef __aarch64__
-                    // Load this head's fixed 128-element query once, then reuse
-                    // the four registers for every token in the current page.
-                    const svbool_t pg16 = svptrue_b16();
-                    const svbool_t pg32 = svptrue_b32();
-                    const svbfloat16_t q0 = svld1_bf16(pg16, q_head);
-                    const svbfloat16_t q1 = svld1_bf16(pg16, q_head + 32);
-                    const svbfloat16_t q2 = svld1_bf16(pg16, q_head + 64);
-                    const svbfloat16_t q3 = svld1_bf16(pg16, q_head + 96);
-#endif
                     for (int64_t t = 0; t < valid_tokens; ++t) {
                         const bfloat16_t *k_token = k_page + t * dim;
-#ifdef __aarch64__
-                        svfloat32_t acc = svdup_f32(0.0f);
-                        acc = svbfdot_f32(acc, q0, svld1_bf16(pg16, k_token));
-                        acc = svbfdot_f32(acc, q1, svld1_bf16(pg16, k_token + 32));
-                        acc = svbfdot_f32(acc, q2, svld1_bf16(pg16, k_token + 64));
-                        acc = svbfdot_f32(acc, q3, svld1_bf16(pg16, k_token + 96));
-                        const float dot = svaddv_f32(pg32, acc);
-#else
                         float dot = 0.0f;
                         for (int64_t d = 0; d < dim; ++d) {
                             dot += to_float(q_head[d]) * to_float(k_token[d]);
                         }
-#endif
                         page_output[t] += std::max(0.0f, dot) * weight;
                     }
                 }
@@ -117,5 +241,6 @@ inline void indexer_bf16_paged_mqa_logits(
                 std::copy(page_output, page_output + valid_tokens, out + token_base);
             }
         }
+#endif
     }
 }

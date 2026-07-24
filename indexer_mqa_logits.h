@@ -29,6 +29,11 @@ asm(R"(
     .global pac_sme_page_scores
     .type pac_sme_page_scores, %function
 pac_sme_page_scores:
+    sub sp, sp, #64
+    stp d8, d9, [sp, #0]
+    stp d10, d11, [sp, #16]
+    stp d12, d13, [sp, #32]
+    stp d14, d15, [sp, #48]
     smstart
     ptrue p0.h
     ptrue p1.h
@@ -76,6 +81,10 @@ pac_sme_page_scores:
     subs x3, x3, #1
     b.ne 1b
     smstop
+    ldp d8, d9, [sp], #16
+    ldp d10, d11, [sp], #16
+    ldp d12, d13, [sp], #16
+    ldp d14, d15, [sp], #16
     ret
     .size pac_sme_page_scores, .-pac_sme_page_scores
 )");

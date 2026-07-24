@@ -124,6 +124,8 @@ inline void indexer_bf16_paged_mqa_logits(
         alignas(64) bfloat16_t packed_q[2][64 * 128];
         alignas(64) bfloat16_t packed_k[64 * 128];
         alignas(64) float page_scores[64 * 64];
+        const svbool_t pack_pg = svptrue_b32();
+        const svuint32_t pack_offsets = svindex_u32(0, 256);
 
         for (int64_t n = 0; n < next_n; ++n) {
             const int64_t row = batch_idx * next_n + n;
@@ -155,12 +157,12 @@ inline void indexer_bf16_paged_mqa_logits(
             for (int64_t tb = 0; tb < 4; ++tb) {
                 for (int64_t kp = 0; kp < 64; ++kp) {
                     bfloat16_t *dst = packed_k + (tb * 64 + kp) * 32;
-                    for (int64_t t = 0; t < 16; ++t) {
-                        const bfloat16_t *src =
-                            k_page + (tb * 16 + t) * dim + kp * 2;
-                        dst[t * 2] = src[0];
-                        dst[t * 2 + 1] = src[1];
-                    }
+                    const bfloat16_t *src =
+                        k_page + tb * 16 * dim + kp * 2;
+                    const svuint32_t pairs = svld1_gather_u32offset_u32(
+                        pack_pg, reinterpret_cast<const uint32_t *>(src),
+                        pack_offsets);
+                    svst1_u32(pack_pg, reinterpret_cast<uint32_t *>(dst), pairs);
                 }
             }
 

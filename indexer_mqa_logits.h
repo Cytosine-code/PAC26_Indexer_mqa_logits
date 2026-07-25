@@ -133,12 +133,14 @@ inline void indexer_bf16_paged_mqa_logits(
             for (int64_t kp = 0; kp < 64; ++kp) {
                 for (int64_t hb = 0; hb < 4; ++hb) {
                     bfloat16_t *dst = packed_q[n] + (kp * 4 + hb) * 32;
-                    for (int64_t h = 0; h < 16; ++h) {
-                        const bfloat16_t *src =
-                            q_row + (hb * 16 + h) * dim + kp * 2;
-                        dst[h * 2] = src[0];
-                        dst[h * 2 + 1] = src[1];
-                    }
+                    // Each head row is 256 bytes apart. A 32-bit gather
+                    // collects the adjacent BF16 pair from all 16 heads.
+                    const bfloat16_t *src =
+                        q_row + hb * 16 * dim + kp * 2;
+                    const svuint32_t pairs = svld1_gather_u32offset_u32(
+                        pack_pg, reinterpret_cast<const uint32_t *>(src),
+                        pack_offsets);
+                    svst1_u32(pack_pg, reinterpret_cast<uint32_t *>(dst), pairs);
                 }
             }
             float *out = output_ptr + row * max_model_len;

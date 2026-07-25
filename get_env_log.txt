@@ -73,7 +73,7 @@ CPU revision  : 0
 
 SVE VL (bits): 512
 SVE VL (bytes): 64
-SME SVL (bits): 128
+SME SVL (bits): 512
 L1d cache:                     19 MiB (608 instances)
 L1i cache:                     19 MiB (608 instances)
 L2 cache:                      456 MiB (608 instances)

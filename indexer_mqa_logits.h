@@ -144,17 +144,50 @@ inline void indexer_bf16_paged_mqa_logits(
                 }
             }
             float *out = output_ptr + row * max_model_len;
-            std::fill(out, out + max_model_len, -INFINITY);
+            const int64_t valid_length = context_len - next_n + n + 1;
+            std::fill(out + valid_length, out + max_model_len, -INFINITY);
         }
 
         for (int64_t logical_block = 0; logical_block < num_blocks; ++logical_block) {
             const int64_t physical_block =
                 block_table_ptr[batch_idx * max_num_blocks + logical_block];
             if (physical_block < 0) {
+                const int64_t token_base = logical_block * block_size;
+                for (int64_t n = 0; n < next_n; ++n) {
+                    const int64_t row = batch_idx * next_n + n;
+                    const int64_t valid_length = context_len - next_n + n + 1;
+                    const int64_t invalid_tokens = std::min<int64_t>(
+                        block_size, valid_length - token_base);
+                    if (invalid_tokens > 0) {
+                        float *out = output_ptr + row * max_model_len + token_base;
+                        std::fill(out, out + invalid_tokens, -INFINITY);
+                    }
+                }
                 continue;
             }
             const bfloat16_t *k_page =
                 kv_ptr + physical_block * block_size * dim;
+
+            // Logical pages are randomly mapped to physical pages, so the
+            // hardware stream prefetcher cannot discover the next address.
+            // Pull sparse lines from the next 16 KiB page toward L2 while the
+            // current page is being packed and consumed.
+            if (logical_block + 1 < num_blocks) {
+                const int64_t next_physical_block = block_table_ptr[
+                    batch_idx * max_num_blocks + logical_block + 1];
+                if (next_physical_block >= 0) {
+                    const bfloat16_t *next_page =
+                        kv_ptr + next_physical_block * block_size * dim;
+                    __builtin_prefetch(next_page + 0 * 1024, 0, 2);
+                    __builtin_prefetch(next_page + 1 * 1024, 0, 2);
+                    __builtin_prefetch(next_page + 2 * 1024, 0, 2);
+                    __builtin_prefetch(next_page + 3 * 1024, 0, 2);
+                    __builtin_prefetch(next_page + 4 * 1024, 0, 2);
+                    __builtin_prefetch(next_page + 5 * 1024, 0, 2);
+                    __builtin_prefetch(next_page + 6 * 1024, 0, 2);
+                    __builtin_prefetch(next_page + 7 * 1024, 0, 2);
+                }
+            }
 
             for (int64_t tb = 0; tb < 4; ++tb) {
                 for (int64_t kp = 0; kp < 64; ++kp) {

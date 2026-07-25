@@ -32,7 +32,7 @@ asm(R"(
     .global pac_sme_tile_fused
     .type pac_sme_tile_fused, %function
 pac_sme_tile_fused:
-    sub sp, sp, #64
+    sub sp, sp, #192
     stp d8, d9, [sp, #0]
     stp d10, d11, [sp, #16]
     stp d12, d13, [sp, #32]
@@ -46,7 +46,7 @@ pac_sme_tile_fused:
     mov x6, x1
     mov x7, #64
 
-    /* BFMOPA: 64 kp iterations, same as before */
+    /* BFMOPA: 64 kp iterations */
 1:  ld1h {z0.h}, p0/z, [x5]
     ld1h {z1.h}, p0/z, [x5, #1, mul vl]
     ld1h {z2.h}, p0/z, [x5, #2, mul vl]
@@ -61,91 +61,69 @@ pac_sme_tile_fused:
     subs x7, x7, #1
     b.ne 1b
 
-    /* Post-processing: fuse ReLU + weight + reduce into ZA output */
-    eor z5.d, z5.d, z5.d      /* result accumulator = 0 */
-    eor z2.d, z2.d, z2.d      /* zero for ReLU */
-    mov x8, x2                 /* x8 = weights pointer */
+    /* Post-processing: fuse ReLU + weight + reduce */
+    eor z2.d, z2.d, z2.d                     /* zero for ReLU */
+    eor z5.d, z5.d, z5.d                     /* result = 0 */
+
+    add x11, sp, #128                        /* x11 = ZA row temp */
+    mov x8, x2                               /* x8 = weights */
 
     /* Tile za0: heads 0..15 */
     mov w12, #0
-    ld1w {z1.s}, p1/z, [x8]
-    mova {z0.s}, p1/z, za0v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[0]; add w12, w12, #1
-    mova {z0.s}, p1/z, za0v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[1]; add w12, w12, #1
-    mova {z0.s}, p1/z, za0v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[2]; add w12, w12, #1
-    mova {z0.s}, p1/z, za0v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[3]; add w12, w12, #1
-    mova {z0.s}, p1/z, za0v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[4]; add w12, w12, #1
-    mova {z0.s}, p1/z, za0v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[5]; add w12, w12, #1
-    mova {z0.s}, p1/z, za0v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[6]; add w12, w12, #1
-    mova {z0.s}, p1/z, za0v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[7]; add w12, w12, #1
-    mova {z0.s}, p1/z, za0v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[8]; add w12, w12, #1
-    mova {z0.s}, p1/z, za0v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[9]; add w12, w12, #1
-    mova {z0.s}, p1/z, za0v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[10]; add w12, w12, #1
-    mova {z0.s}, p1/z, za0v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[11]; add w12, w12, #1
-    mova {z0.s}, p1/z, za0v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[12]; add w12, w12, #1
-    mova {z0.s}, p1/z, za0v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[13]; add w12, w12, #1
-    mova {z0.s}, p1/z, za0v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[14]; add w12, w12, #1
-    mova {z0.s}, p1/z, za0v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[15]; add w12, w12, #1
+2:  st1w {za0h.s[w12, 0]}, p1, [x11]        /* store head w12's scores */
+    ld1w {z0.s}, p1/z, [x11]                /* load to SVE */
+    fmax z0.s, p1/m, z0.s, z2.s             /* ReLU */
+    add x14, x8, w12, uxtw #2               /* x14 = &weights[w12] */
+    ldr w5, [x14]                            /* load weight */
+    dup z3.s, w5                             /* broadcast to SVE */
+    fmla z5.s, p1/m, z0.s, z3.s             /* z5[t] += score[t] × weight[w12] */
+    add w12, w12, #1
+    cmp w12, #16
+    b.lo 2b
 
     /* Tile za1: heads 16..31 */
     mov w12, #0
-    ld1w {z1.s}, p1/z, [x8, #64]
-    mova {z0.s}, p1/z, za1v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[0]; add w12, w12, #1
-    mova {z0.s}, p1/z, za1v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[1]; add w12, w12, #1
-    mova {z0.s}, p1/z, za1v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[2]; add w12, w12, #1
-    mova {z0.s}, p1/z, za1v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[3]; add w12, w12, #1
-    mova {z0.s}, p1/z, za1v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[4]; add w12, w12, #1
-    mova {z0.s}, p1/z, za1v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[5]; add w12, w12, #1
-    mova {z0.s}, p1/z, za1v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[6]; add w12, w12, #1
-    mova {z0.s}, p1/z, za1v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[7]; add w12, w12, #1
-    mova {z0.s}, p1/z, za1v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[8]; add w12, w12, #1
-    mova {z0.s}, p1/z, za1v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[9]; add w12, w12, #1
-    mova {z0.s}, p1/z, za1v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[10]; add w12, w12, #1
-    mova {z0.s}, p1/z, za1v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[11]; add w12, w12, #1
-    mova {z0.s}, p1/z, za1v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[12]; add w12, w12, #1
-    mova {z0.s}, p1/z, za1v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[13]; add w12, w12, #1
-    mova {z0.s}, p1/z, za1v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[14]; add w12, w12, #1
-    mova {z0.s}, p1/z, za1v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[15]; add w12, w12, #1
+3:  st1w {za1h.s[w12, 0]}, p1, [x11]
+    ld1w {z0.s}, p1/z, [x11]
+    fmax z0.s, p1/m, z0.s, z2.s
+    add x14, x8, #64
+    add x14, x14, w12, uxtw #2             /* x14 = &weights[16 + w12] */
+    ldr w5, [x14]
+    dup z3.s, w5
+    fmla z5.s, p1/m, z0.s, z3.s
+    add w12, w12, #1
+    cmp w12, #16
+    b.lo 3b
 
     /* Tile za2: heads 32..47 */
     mov w12, #0
-    ld1w {z1.s}, p1/z, [x8, #128]
-    mova {z0.s}, p1/z, za2v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[0]; add w12, w12, #1
-    mova {z0.s}, p1/z, za2v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[1]; add w12, w12, #1
-    mova {z0.s}, p1/z, za2v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[2]; add w12, w12, #1
-    mova {z0.s}, p1/z, za2v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[3]; add w12, w12, #1
-    mova {z0.s}, p1/z, za2v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[4]; add w12, w12, #1
-    mova {z0.s}, p1/z, za2v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[5]; add w12, w12, #1
-    mova {z0.s}, p1/z, za2v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[6]; add w12, w12, #1
-    mova {z0.s}, p1/z, za2v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[7]; add w12, w12, #1
-    mova {z0.s}, p1/z, za2v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[8]; add w12, w12, #1
-    mova {z0.s}, p1/z, za2v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[9]; add w12, w12, #1
-    mova {z0.s}, p1/z, za2v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[10]; add w12, w12, #1
-    mova {z0.s}, p1/z, za2v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[11]; add w12, w12, #1
-    mova {z0.s}, p1/z, za2v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[12]; add w12, w12, #1
-    mova {z0.s}, p1/z, za2v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[13]; add w12, w12, #1
-    mova {z0.s}, p1/z, za2v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[14]; add w12, w12, #1
-    mova {z0.s}, p1/z, za2v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[15]; add w12, w12, #1
+4:  st1w {za2h.s[w12, 0]}, p1, [x11]
+    ld1w {z0.s}, p1/z, [x11]
+    fmax z0.s, p1/m, z0.s, z2.s
+    add x14, x8, #128
+    add x14, x14, w12, uxtw #2
+    ldr w5, [x14]
+    dup z3.s, w5
+    fmla z5.s, p1/m, z0.s, z3.s
+    add w12, w12, #1
+    cmp w12, #16
+    b.lo 4b
 
     /* Tile za3: heads 48..63 */
     mov w12, #0
-    ld1w {z1.s}, p1/z, [x8, #192]
-    mova {z0.s}, p1/z, za3v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[0]; add w12, w12, #1
-    mova {z0.s}, p1/z, za3v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[1]; add w12, w12, #1
-    mova {z0.s}, p1/z, za3v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[2]; add w12, w12, #1
-    mova {z0.s}, p1/z, za3v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[3]; add w12, w12, #1
-    mova {z0.s}, p1/z, za3v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[4]; add w12, w12, #1
-    mova {z0.s}, p1/z, za3v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[5]; add w12, w12, #1
-    mova {z0.s}, p1/z, za3v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[6]; add w12, w12, #1
-    mova {z0.s}, p1/z, za3v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[7]; add w12, w12, #1
-    mova {z0.s}, p1/z, za3v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[8]; add w12, w12, #1
-    mova {z0.s}, p1/z, za3v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[9]; add w12, w12, #1
-    mova {z0.s}, p1/z, za3v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[10]; add w12, w12, #1
-    mova {z0.s}, p1/z, za3v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[11]; add w12, w12, #1
-    mova {z0.s}, p1/z, za3v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[12]; add w12, w12, #1
-    mova {z0.s}, p1/z, za3v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[13]; add w12, w12, #1
-    mova {z0.s}, p1/z, za3v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[14]; add w12, w12, #1
-    mova {z0.s}, p1/z, za3v.s[w12, 0]; fmax z0.s, p1/m, z0.s, z2.s; fmla z5.s, p1/m, z0.s, z1.s[15]; add w12, w12, #1
+5:  st1w {za3h.s[w12, 0]}, p1, [x11]
+    ld1w {z0.s}, p1/z, [x11]
+    fmax z0.s, p1/m, z0.s, z2.s
+    add x14, x8, #192
+    add x14, x14, w12, uxtw #2
+    ldr w5, [x14]
+    dup z3.s, w5
+    fmla z5.s, p1/m, z0.s, z3.s
+    add w12, w12, #1
+    cmp w12, #16
+    b.lo 5b
 
+    /* Store result, masked by valid_tokens */
     whilelt p2.s, xzr, x4
     st1w {z5.s}, p2, [x3]
 
@@ -154,7 +132,7 @@ pac_sme_tile_fused:
     ldp d10, d11, [sp, #16]
     ldp d12, d13, [sp, #32]
     ldp d14, d15, [sp, #48]
-    add sp, sp, #64
+    add sp, sp, #192
     ret
     .size pac_sme_tile_fused, .-pac_sme_tile_fused
 )");

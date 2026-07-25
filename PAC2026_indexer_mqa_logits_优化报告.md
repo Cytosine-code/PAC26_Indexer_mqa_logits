@@ -401,6 +401,42 @@ V4 相对 V3 分别提升 33.08% 和 52.70%。Case 2 的单个 K Packing 只服�
 
 两个用例的 `cos_diff` 均满足 `< 5e-6`，说明 Gather 仅改变了数据搬运方式，没有改变 BF16 输入、SME 点积、ReLU 和加权归约的数值语义。
 
+### 3.7 V5：消除 Page Scores 中间缓冲（尝试，未采纳）
+
+V4 的数据流包含一次完整的 ZA → memory → SVE 中转：
+
+```text
+BFMOPA → ZA[16×16] → st1w → page_scores[64×64] (16 KB) → ld1w → SVE 后处理
+```
+
+V5 尝试将后处理（ReLU、Head Weight、Head Reduction）熔入 SME streaming mode，消除 page_scores 中转。核心思路：每 tile 计算完 BFMOPA 后，不写回 page_scores，而是逐行从 ZA 读出、在 SVE 寄存器内完成 ReLU + 加权归约，直接累加到输出的 `[16]` 向量。
+
+实现方案：
+
+```text
+BFMOPA (64 kp) → ZA[16×16]
+  → 逐行 st1w + ld1w（L1 中转 64 bytes）
+  → fmax ReLU
+  → ldr + dup 加载标量 weight
+  → fmla 累加到 result[16]
+  → 存 output
+```
+
+实测结果：
+
+| 测试用例 | V4 (GFLOPS) | V5 (GFLOPS) | 降幅 |
+|---|---:|---:|---:|
+| Case 1 | 7798.54 | 4510.99 | -42.2% |
+| Case 2 | 6600.30 | 4288.69 | -35.0% |
+
+精度满足 `< 5e-6`。性能下降的原因分析：
+
+1. **逐行 st1w + ld1w 增加了 L1 读写流量。** 每个 tile 16 行 × 4 tile = 64 次 64-byte 的 store+load（4 KB 额外 L1 流量），V4 一次 st1w 写 16 KB 可以充分发挥写合并带宽。
+2. **逐 head 加载权重的 IPC 瓶颈。** V4 用 `ld1w` 一次加载 16 个 weight，展开的 64 次 `svmla_n_f32` 循环编译器可以有效调度；V5 的 `ldr + dup + fmla` 每次只有一条 fmla 做计算，加载权重需要额外的地址计算和数据搬运指令，占用指令发射带宽。
+3. **SME 外区域指令开销。** ZA 行存储（`st1w`）和 SVE 加载（`ld1w`）在 streaming mode 内各占不同的执行流水线，但 64 次的小循环体无法充分利用发射队列，导致流水线气泡。
+
+结论：消除 page_scores 在方向上是正确的，但当前实现增加的 L1 流量和逐标量 weight 加载开销超过了消除大缓冲带来的收益。保留 page_scores 的 V4 方案在现有硬件上更优。
+
 ### 3.6 当前性能汇总
 
 | 测试用例              | Baseline  | Page V1   | SVE V2     | SME V3  | SME V4  | SME V4/Baseline |

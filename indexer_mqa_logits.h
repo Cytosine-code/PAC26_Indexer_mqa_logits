@@ -18,123 +18,75 @@
 #endif
 
 #ifdef __aarch64__
-extern "C" void pac_sme_tile_fused(
-    const bfloat16_t *packed_q,
-    const bfloat16_t *packed_k,
-    const float *weights,
-    float *output,
-    int64_t valid_tokens);
+extern "C" void pac_sme_page_scores(
+    const bfloat16_t *packed_q, const bfloat16_t *packed_k,
+    float *scores, int64_t token_tiles);
 
 asm(R"(
     .arch armv9-a+sme+sve2
     .text
     .align 4
-    .global pac_sme_tile_fused
-    .type pac_sme_tile_fused, %function
-pac_sme_tile_fused:
-    sub sp, sp, #192
+    .global pac_sme_page_scores
+    .type pac_sme_page_scores, %function
+pac_sme_page_scores:
+    sub sp, sp, #64
     stp d8, d9, [sp, #0]
     stp d10, d11, [sp, #16]
     stp d12, d13, [sp, #32]
     stp d14, d15, [sp, #48]
     smstart
     ptrue p0.h
-    ptrue p1.s
+    ptrue p1.h
+    ptrue p2.s
+    mov x7, x2
 
+1:
     zero {za}
-    mov x5, x0
-    mov x6, x1
-    mov x7, #64
+    mov x4, x0
+    mov x5, x1
+    mov x6, #64
 
-    /* BFMOPA: 64 kp iterations */
-1:  ld1h {z0.h}, p0/z, [x5]
-    ld1h {z1.h}, p0/z, [x5, #1, mul vl]
-    ld1h {z2.h}, p0/z, [x5, #2, mul vl]
-    ld1h {z3.h}, p0/z, [x5, #3, mul vl]
-    ld1h {z4.h}, p0/z, [x6]
+2:
+    ld1h {z0.h}, p1/z, [x4]
+    ld1h {z1.h}, p1/z, [x4, #1, mul vl]
+    ld1h {z2.h}, p1/z, [x4, #2, mul vl]
+    ld1h {z3.h}, p1/z, [x4, #3, mul vl]
+    ld1h {z4.h}, p1/z, [x5]
     bfmopa za0.s, p0/m, p0/m, z0.h, z4.h
     bfmopa za1.s, p0/m, p0/m, z1.h, z4.h
     bfmopa za2.s, p0/m, p0/m, z2.h, z4.h
     bfmopa za3.s, p0/m, p0/m, z3.h, z4.h
-    add x5, x5, #256
-    add x6, x6, #64
-    subs x7, x7, #1
-    b.ne 1b
+    add x4, x4, #256
+    add x5, x5, #64
+    subs x6, x6, #1
+    b.ne 2b
 
-    /* Post-processing: fuse ReLU + weight + reduce */
-    eor z2.d, z2.d, z2.d                     /* zero for ReLU */
-    eor z5.d, z5.d, z5.d                     /* result = 0 */
-
-    add x11, sp, #128                        /* x11 = ZA row temp */
-    mov x8, x2                               /* x8 = weights */
-
-    /* Tile za0: heads 0..15 */
     mov w12, #0
-2:  st1w {za0h.s[w12, 0]}, p1, [x11]        /* store head w12's scores */
-    ld1w {z0.s}, p1/z, [x11]                /* load to SVE */
-    fmax z0.s, p1/m, z0.s, z2.s             /* ReLU */
-    add x14, x8, w12, uxtw #2               /* x14 = &weights[w12] */
-    ldr w5, [x14]                            /* load weight */
-    dup z3.s, w5                             /* broadcast to SVE */
-    fmla z5.s, p1/m, z0.s, z3.s             /* z5[t] += score[t] × weight[w12] */
-    add w12, w12, #1
-    cmp w12, #16
-    b.lo 2b
-
-    /* Tile za1: heads 16..31 */
-    mov w12, #0
-3:  st1w {za1h.s[w12, 0]}, p1, [x11]
-    ld1w {z0.s}, p1/z, [x11]
-    fmax z0.s, p1/m, z0.s, z2.s
-    add x14, x8, #64
-    add x14, x14, w12, uxtw #2             /* x14 = &weights[16 + w12] */
-    ldr w5, [x14]
-    dup z3.s, w5
-    fmla z5.s, p1/m, z0.s, z3.s
+    mov x8, x7
+3:
+    add x9, x8, #1, lsl #12
+    add x10, x8, #2, lsl #12
+    add x11, x8, #3, lsl #12
+    st1w {za0h.s[w12, 0]}, p2, [x8]
+    st1w {za1h.s[w12, 0]}, p2, [x9]
+    st1w {za2h.s[w12, 0]}, p2, [x10]
+    st1w {za3h.s[w12, 0]}, p2, [x11]
+    add x8, x8, #256
     add w12, w12, #1
     cmp w12, #16
     b.lo 3b
 
-    /* Tile za2: heads 32..47 */
-    mov w12, #0
-4:  st1w {za2h.s[w12, 0]}, p1, [x11]
-    ld1w {z0.s}, p1/z, [x11]
-    fmax z0.s, p1/m, z0.s, z2.s
-    add x14, x8, #128
-    add x14, x14, w12, uxtw #2
-    ldr w5, [x14]
-    dup z3.s, w5
-    fmla z5.s, p1/m, z0.s, z3.s
-    add w12, w12, #1
-    cmp w12, #16
-    b.lo 4b
-
-    /* Tile za3: heads 48..63 */
-    mov w12, #0
-5:  st1w {za3h.s[w12, 0]}, p1, [x11]
-    ld1w {z0.s}, p1/z, [x11]
-    fmax z0.s, p1/m, z0.s, z2.s
-    add x14, x8, #192
-    add x14, x14, w12, uxtw #2
-    ldr w5, [x14]
-    dup z3.s, w5
-    fmla z5.s, p1/m, z0.s, z3.s
-    add w12, w12, #1
-    cmp w12, #16
-    b.lo 5b
-
-    /* Store result, masked by valid_tokens */
-    whilelt p2.s, xzr, x4
-    st1w {z5.s}, p2, [x3]
-
+    add x1, x1, #1, lsl #12
+    add x7, x7, #64
+    subs x3, x3, #1
+    b.ne 1b
     smstop
-    ldp d8, d9, [sp, #0]
-    ldp d10, d11, [sp, #16]
-    ldp d12, d13, [sp, #32]
-    ldp d14, d15, [sp, #48]
-    add sp, sp, #192
+    ldp d8, d9, [sp], #16
+    ldp d10, d11, [sp], #16
+    ldp d12, d13, [sp], #16
+    ldp d14, d15, [sp], #16
     ret
-    .size pac_sme_tile_fused, .-pac_sme_tile_fused
+    .size pac_sme_page_scores, .-pac_sme_page_scores
 )");
 #endif
 
@@ -171,6 +123,7 @@ inline void indexer_bf16_paged_mqa_logits(
 #ifdef __aarch64__
         alignas(64) bfloat16_t packed_q[2][64 * 128];
         alignas(64) bfloat16_t packed_k[64 * 128];
+        alignas(64) float page_scores[64 * 64];
         const svbool_t pack_pg = svptrue_b32();
         const svuint32_t pack_offsets = svindex_u32(0, 256);
 
@@ -223,17 +176,28 @@ inline void indexer_bf16_paged_mqa_logits(
                     continue;
                 }
                 const int64_t token_tiles = ceil_div(valid_tokens, int64_t(16));
+                pac_sme_page_scores(
+                    packed_q[n], packed_k, page_scores, token_tiles);
+
                 const float *row_weights = weight_ptr + row * num_heads;
                 float *out = output_ptr + row * max_model_len + token_base;
+                const svbool_t all = svptrue_b32();
+                const svfloat32_t zero = svdup_f32(0.0f);
                 for (int64_t tb = 0; tb < token_tiles; ++tb) {
+                    svfloat32_t result = zero;
+                    for (int64_t h = 0; h < 64; ++h) {
+                        const svfloat32_t score = svld1_f32(
+                            all, page_scores + h * 64 + tb * 16);
+                        const svfloat32_t activated =
+                            svmax_f32_x(all, score, zero);
+                        result = svmla_n_f32_x(
+                            all, result, activated, row_weights[h]);
+                    }
                     const int64_t tile_valid =
                         std::min<int64_t>(16, valid_tokens - tb * 16);
-                    pac_sme_tile_fused(
-                        packed_q[n],
-                        packed_k + tb * (64 * 32),
-                        row_weights,
-                        out + tb * 16,
-                        tile_valid);
+                    const svbool_t store_pg =
+                        svwhilelt_b32(uint64_t(0), uint64_t(tile_valid));
+                    svst1_f32(store_pg, out + tb * 16, result);
                 }
             }
         }

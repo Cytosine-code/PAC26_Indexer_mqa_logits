@@ -437,3 +437,112 @@ BFMOPA (64 kp) → ZA[16×16]
 
 结论：消除 page_scores 在方向上是正确的，但当前实现增加的 L1 流量和逐标量 weight 加载开销超过了消除大缓冲带来的收益。保留 page_scores 的 V4 方案在现有硬件上更优。
 
+### 3.7 V6：SVE Gather 加速 Q Packing
+
+V4 已使用 SVE Gather 优化 K Packing，但 Q Packing 仍按 Head 执行标量 BF16 Pair 复制。Q 与 K 的原始 Row Stride 相同，均为：
+
+```text
+128 BF16 × 2 Bytes = 256 Bytes
+```
+
+因此 Q Packing 可以复用 K Packing 的方法。对每个 `(k_pair, head_block)`，使用一条 16-lane 32-bit Gather，从 16 个 Head Row 收集同一对相邻 BF16，再连续写入 64-byte Packed Vector：
+
+```cpp
+const svuint32_t pairs = svld1_gather_u32offset_u32(
+    pack_pg, reinterpret_cast<const uint32_t *>(src), pack_offsets);
+svst1_u32(pack_pg, reinterpret_cast<uint32_t *>(dst), pairs);
+```
+
+每个 Query 的 Q Packing 主体由：
+
+```text
+64 k-pairs × 4 head blocks × 16 scalar copies
+= 4096 次 Pair Copy
+```
+
+缩减为：
+
+```text
+256 次 SVE Gather + 256 次连续 Store
+```
+
+实测结果：
+
+| 测试用例 | V4 | V6 | V6/V4 | 平均耗时 |
+|---|---:|---:|---:|---:|
+| Case 1 | 7798.54 GFLOPS | 8024.85 GFLOPS | 1.0290× | 133.54 μs |
+| Case 2 | 6600.30 GFLOPS | 6794.49 GFLOPS | 1.0294× | 1270.59 μs |
+
+两个用例分别提升 2.90% 和 2.94%，精度检查通过。虽然 Case 1 的 GFLOPS 绝对增量更大，但两者的相对增益和耗时降幅几乎一致，说明 Q Packing 在两个用例总耗时中的占比均约为 3%。
+
+### 3.8 V7：收缩输出初始化并预取下一物理 Page
+
+V7 包含两项互不改变主计算的外围优化。
+
+第一项是只初始化因果有效区之后的 Mask 尾部。原实现先把完整的 8192 个输出元素写成 `-INFINITY`，随后又覆盖有效区；新实现仅执行：
+
+```cpp
+std::fill(out + valid_length, out + max_model_len, -INFINITY);
+```
+
+若 `block_tables` 中出现负物理 Block，则单独将该 Page 对应的有效区写成 `-INFINITY`，从而保持参考实现语义。
+
+第二项是针对随机 Page 映射预取下一物理 KV Page。每个 Page 为 16 KiB，在当前 Page Packing 前，以 2 KiB 间隔发出 8 个 locality=2 的预取提示，使下一 Page 向 L2 靠近，同时避免强行占据当前 L1。
+
+该版本短时测试结果存在明显波动：
+
+| 测试轮次 | Case 1 | Case 2 |
+|---|---:|---:|
+| 第 1 次 | 7.87 TFLOPS | 6.89 TFLOPS |
+| 第 2 次 | 8.07 TFLOPS | 6.92 TFLOPS |
+
+Case 1 在一次测试中低于 V6、另一次略高于 V6；Case 2 两次均略高于 V6，但幅度仅约 1%～2%。由于 Case 1 单次平均耗时仅约 134 μs，数微秒波动即可造成明显的 GFLOPS 变化。该项优化未观察到稳定负优化，且减少了理论冗余工作，因此予以保留，但不将其收益计入稳定版本加速结论。
+
+### 3.9 V8：BFMOPA 双缓冲软件流水
+
+原 SME 主循环每个 K-pair 依次执行 5 条 Load 和 4 条 BFMOPA，随后才开始加载下一组。V8 使用两套 Z 寄存器实现奇偶 K-pair 双缓冲：
+
+```text
+偶数组：z0-z4
+奇数组：z5-z9
+```
+
+执行顺序调整为：
+
+```text
+预加载 pair 0
+加载 pair 1 -> 计算 pair 0
+加载 pair 2 -> 计算 pair 1
+加载 pair 3 -> 计算 pair 2
+...
+```
+
+目标是让下一组 Q/K Load 与当前组 BFMOPA 在处理器流水线上重叠。循环采用 31 次双迭代和最后一对尾处理，不会越界读取。ZA 的实际累加顺序仍严格保持 `pair 0,1,...,63`，因此没有改变浮点结合顺序。
+
+实测结果：
+
+| 测试用例 | V6 稳定基线 | V8 流水版 | 相对 V6 |
+|---|---:|---:|---:|
+| Case 1 | 8024.85 GFLOPS | 8093.71 GFLOPS | 1.0086× |
+| Case 2 | 6794.49 GFLOPS | 6805.02 GFLOPS | 1.0015× |
+
+精度检查通过。Case 1 提升约 0.86%，Case 2 提升约 0.15%，收益较小。这表明 LX2 对原始 Load/BFMOPA 循环已经具备较好的乱序调度能力，或者 SME 矩阵执行单元的 ZA 累加吞吐比 Load 延迟更接近当前瓶颈。双缓冲增加了寄存器使用和循环体尺寸，但没有产生明显负优化，因此当前版本予以保留。
+
+### 3.10 近期版本汇总
+
+| 版本 | 主要变化 | Case 1 GFLOPS | Case 2 GFLOPS | 结论 |
+|---|---|---:|---:|---|
+| V4 | K Packing SVE Gather | 7798.54 | 6600.30 | 显著有效 |
+| V5 | 消除 page_scores 尝试 | 4510.99 | 4288.69 | 明显负优化，回退 |
+| V6 | Q Packing SVE Gather | 8024.85 | 6794.49 | 稳定提升约 2.9% |
+| V7 | Mask 尾部初始化 + 下一 Page 预取 | 7870～8070 | 6890～6920 | 与波动同量级，保留 |
+| V8 | BFMOPA 双缓冲流水 | 8093.71 | 6805.02 | 小幅提升，保留 |
+
+以 V8 实测值计算，相对原始 Baseline：
+
+```text
+Case 1: 8093.71 / 38.219666 = 211.77×
+Case 2: 6805.02 / 42.419292 = 160.42×
+```
+
+近期优化结果说明，Packing 曾是 SME 初版的重要瓶颈，但在 Q/K 均改为 SVE Gather 后，外围数据重排成本已经显著降低。输出初始化、Page 预取和 BFMOPA 软件流水只带来波动范围内或约 1% 的增益，后续需要通过 LX2 单 NUMA Roofline、内存带宽及 BFMOPA 吞吐微基准重新定位主要限制，而不宜继续依靠直觉堆叠零碎指令优化。

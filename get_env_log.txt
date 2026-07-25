@@ -1,0 +1,124 @@
+* HPCCKit setting environment variables...
+* compiler setvars
+* hmpi setvars
+* kml setvars
+* kudnn setvars
+* kupl setvars
+* kuqcd setvars
+* hio setvars
+
+* HPCCKit environment variables inited
+Architecture:                  aarch64
+CPU op-mode(s):                64-bit
+Byte Order:                    Little Endian
+CPU(s):                        608
+On-line CPU(s) list:           0-607
+Vendor ID:                     HiSilicon
+Model:                         0
+Thread(s) per core:            1
+Core(s) per socket:            304
+Socket(s):                     2
+Stepping:                      0x0
+Frequency boost:               disabled
+CPU max MHz:                   2000.0000
+CPU min MHz:                   1200.0000
+BogoMIPS:                      200.00
+Flags:                         fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm ssbs sb paca pacg dcpodp sve2 sveaes svepmull svebitperm svesha3 svesm4 flagm2 frint svei8mm svebf16 i8mm bf16 dgh ecv afp rpres sme smef64f64 smei8i32 smef16f32 smeb16f32 smef32f32 smefa64 wfxt
+L1d cache:                     19 MiB (608 instances)
+L1i cache:                     19 MiB (608 instances)
+L2 cache:                      456 MiB (608 instances)
+NUMA node(s):                  32
+NUMA node0 CPU(s):             0-37
+NUMA node1 CPU(s):             38-75
+...
+NUMA node14 CPU(s):            532-569
+NUMA node15 CPU(s):            570-607
+NUMA node16 CPU(s):
+...
+NUMA node31 CPU(s):
+
+Vulnerability Gather data sampling: Not affected
+Vulnerability Itlb multihit:     Not affected
+Vulnerability L1tf:              Not affected
+Vulnerability Mds:               Not affected
+Vulnerability Meltdown:          Not affected
+Vulnerability Mmio stale data:   Not affected
+Vulnerability Retbleed:          Not affected
+Vulnerability Spec rstack overflow: Not affected
+Vulnerability Spec store bypass: Not affected
+Vulnerability Spectre v1:        Mitigation; __user pointer sanitization
+Vulnerability Spectre v2:        Mitigation; CSV2, but not BHB
+Vulnerability Srbbds:            Not affected
+Vulnerability Tsx async abort:   Not affected
+
+processor    : 0
+BogoMIPS     : 200.00
+Features     : fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm ssbs sb paca pacg dcpodp sve2 sveaes svepmull svebitperm svesha3 svesm4 flagm2 frint svei8mm svebf16 i8mm bf16 dgh ecv afp rpres sme smef64f64 smei8i32 smef16f32 smeb16f32 smef32f32 smefa64 wfxt
+CPU implementer : 0x48
+CPU architecture: 8
+CPU variant   : 0x0
+CPU part      : 0xd22
+CPU revision  : 0
+
+...
+
+processor    : 8
+BogoMIPS     : 200.00
+Features     : fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm ssbs sb paca pacg dcpodp sve2 sveaes svepmull svebitperm svesha3 svesm4 flagm2 frint svei8mm svebf16 i8mm bf16 dgh ecv afp rpres sme smef64f64 smei8i32 smef16f32 smeb16f32 smef32f32 smefa64 wfxt
+CPU implementer : 0x48
+CPU architecture: 8
+CPU variant   : 0x0
+CPU part      : 0xd22
+CPU revision  : 0
+
+SVE VL (bits): 512
+SVE VL (bytes): 64
+SME SVL (bits): 128
+L1d cache:                     19 MiB (608 instances)
+L1i cache:                     19 MiB (608 instances)
+L2 cache:                      456 MiB (608 instances)
+32K
+32K
+768K
+Data
+Instruction
+Unified
+64
+64
+64
+
+available: 32 nodes (0-31)
+node 0 cpus: 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37
+node 0 size: 31376 MB
+node 0 free: 24653 MB
+node 1 cpus: 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75
+node 1 size: 32250 MB
+node 1 free: 26051 MB
+node 2 cpus: 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99 100 101 102 103 104 105 106 107 108 109 110 111 112 113
+node 2 size: 32250 MB
+node 2 free: 31210 MB
+...
+policy: default
+preferred node: current
+physcpubind: 37 75 113 151 189 227 265 303 341 379 417 455 493 531 569 607
+cpubind: 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+nodebind: 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31
+preferred:
+has_cpu
+has_generic_initiator
+has_memory
+has_normal_memory
+is_cdm_node
+node0
+node1
+...
+node9
+online
+possible
+power
+uevent
+
+g++ (gcc for openEuler 3.0.3) 12.3.1
+Copyright (C) 2022 Free Software Foundation, Inc.
+This is free software; see the source for copying conditions.  There is NO
+warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.

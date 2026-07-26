@@ -44,65 +44,22 @@ pac_sme_page_scores:
     zero {za}
     mov x4, x0
     mov x5, x1
+    mov x6, #64
 
-    /* Preload even K-pair 0 into z0-z4. */
+2:
     ld1h {z0.h}, p1/z, [x4]
     ld1h {z1.h}, p1/z, [x4, #1, mul vl]
     ld1h {z2.h}, p1/z, [x4, #2, mul vl]
     ld1h {z3.h}, p1/z, [x4, #3, mul vl]
     ld1h {z4.h}, p1/z, [x5]
-    add x4, x4, #256
-    add x5, x5, #64
-    mov x6, #31
-
-    /* Process pairs (0,1) through (60,61). While one register set is
-       consumed by BFMOPA, populate the other set for the next K-pair. */
-2:
-    ld1h {z5.h}, p1/z, [x4]
-    ld1h {z6.h}, p1/z, [x4, #1, mul vl]
-    ld1h {z7.h}, p1/z, [x4, #2, mul vl]
-    ld1h {z8.h}, p1/z, [x4, #3, mul vl]
-    ld1h {z9.h}, p1/z, [x5]
-    add x4, x4, #256
-    add x5, x5, #64
-
     bfmopa za0.s, p0/m, p0/m, z0.h, z4.h
     bfmopa za1.s, p0/m, p0/m, z1.h, z4.h
     bfmopa za2.s, p0/m, p0/m, z2.h, z4.h
     bfmopa za3.s, p0/m, p0/m, z3.h, z4.h
-
-    ld1h {z0.h}, p1/z, [x4]
-    ld1h {z1.h}, p1/z, [x4, #1, mul vl]
-    ld1h {z2.h}, p1/z, [x4, #2, mul vl]
-    ld1h {z3.h}, p1/z, [x4, #3, mul vl]
-    ld1h {z4.h}, p1/z, [x5]
     add x4, x4, #256
     add x5, x5, #64
-
-    bfmopa za0.s, p0/m, p0/m, z5.h, z9.h
-    bfmopa za1.s, p0/m, p0/m, z6.h, z9.h
-    bfmopa za2.s, p0/m, p0/m, z7.h, z9.h
-    bfmopa za3.s, p0/m, p0/m, z8.h, z9.h
-
     subs x6, x6, #1
     b.ne 2b
-
-    /* Tail pair: even 62 is already in z0-z4; load and process odd 63
-       without reading beyond the packed buffers. */
-    ld1h {z5.h}, p1/z, [x4]
-    ld1h {z6.h}, p1/z, [x4, #1, mul vl]
-    ld1h {z7.h}, p1/z, [x4, #2, mul vl]
-    ld1h {z8.h}, p1/z, [x4, #3, mul vl]
-    ld1h {z9.h}, p1/z, [x5]
-
-    bfmopa za0.s, p0/m, p0/m, z0.h, z4.h
-    bfmopa za1.s, p0/m, p0/m, z1.h, z4.h
-    bfmopa za2.s, p0/m, p0/m, z2.h, z4.h
-    bfmopa za3.s, p0/m, p0/m, z3.h, z4.h
-    bfmopa za0.s, p0/m, p0/m, z5.h, z9.h
-    bfmopa za1.s, p0/m, p0/m, z6.h, z9.h
-    bfmopa za2.s, p0/m, p0/m, z7.h, z9.h
-    bfmopa za3.s, p0/m, p0/m, z8.h, z9.h
 
     mov w12, #0
     mov x8, x7

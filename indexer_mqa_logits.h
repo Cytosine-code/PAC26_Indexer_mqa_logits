@@ -17,6 +17,18 @@
 #include <arm_sme.h>
 #endif
 
+// Per-thread timing accumulators for phased profiling.
+// Pass an array (size = omp_get_max_threads()) to indexer_bf16_paged_mqa_logits.
+// Times are in microseconds, summed over all batches processed by one thread.
+struct MqaLogitsPhaseTiming {
+    double q_pack_us = 0;
+    double k_pack_us = 0;
+    double sme_us = 0;
+    double postprocess_us = 0;
+    double mask_us = 0;
+    double total_us = 0;       // wall clock of the entire batch loop body
+};
+
 #ifdef __aarch64__
 extern "C" void pac_sme_page_scores(
     const bfloat16_t *packed_q, const bfloat16_t *packed_k,
@@ -102,7 +114,8 @@ inline void indexer_bf16_paged_mqa_logits(
     int64_t num_heads,
     int64_t dim,
     int64_t block_size,
-    int64_t max_model_len
+    int64_t max_model_len,
+    MqaLogitsPhaseTiming *phase_timing = nullptr
 ) {
     const auto *q_ptr = q.data_ptr();
     const auto *kv_ptr = kv_cache.data_ptr();
@@ -127,9 +140,17 @@ inline void indexer_bf16_paged_mqa_logits(
         const svbool_t pack_pg = svptrue_b32();
         const svuint32_t pack_offsets = svindex_u32(0, 256);
 
+        // Timing accumulators for this batch
+        double _t_q = 0, _t_k = 0, _t_s = 0, _t_p = 0, _t_m = 0;
+        double _t_batch_start = get_clock_us();
+        double _t_phase;
+
         for (int64_t n = 0; n < next_n; ++n) {
             const int64_t row = batch_idx * next_n + n;
             const bfloat16_t *q_row = q_ptr + row * num_heads * dim;
+
+            // -------- Q Packing --------
+            _t_phase = get_clock_us();
             for (int64_t kp = 0; kp < 64; ++kp) {
                 for (int64_t hb = 0; hb < 4; ++hb) {
                     bfloat16_t *dst = packed_q[n] + (kp * 4 + hb) * 32;
@@ -143,9 +164,14 @@ inline void indexer_bf16_paged_mqa_logits(
                     svst1_u32(pack_pg, reinterpret_cast<uint32_t *>(dst), pairs);
                 }
             }
+            _t_q += get_clock_us() - _t_phase;
+
+            // -------- Mask Init --------
+            _t_phase = get_clock_us();
             float *out = output_ptr + row * max_model_len;
             const int64_t valid_length = context_len - next_n + n + 1;
             std::fill(out + valid_length, out + max_model_len, -INFINITY);
+            _t_m += get_clock_us() - _t_phase;
         }
 
         for (int64_t logical_block = 0; logical_block < num_blocks; ++logical_block) {
@@ -189,6 +215,8 @@ inline void indexer_bf16_paged_mqa_logits(
                 }
             }
 
+            // -------- K Packing --------
+            _t_phase = get_clock_us();
             for (int64_t tb = 0; tb < 4; ++tb) {
                 for (int64_t kp = 0; kp < 64; ++kp) {
                     bfloat16_t *dst = packed_k + (tb * 64 + kp) * 32;
@@ -200,6 +228,7 @@ inline void indexer_bf16_paged_mqa_logits(
                     svst1_u32(pack_pg, reinterpret_cast<uint32_t *>(dst), pairs);
                 }
             }
+            _t_k += get_clock_us() - _t_phase;
 
             for (int64_t n = 0; n < next_n; ++n) {
                 const int64_t row = batch_idx * next_n + n;
@@ -211,9 +240,15 @@ inline void indexer_bf16_paged_mqa_logits(
                     continue;
                 }
                 const int64_t token_tiles = ceil_div(valid_tokens, int64_t(16));
+
+                // -------- SME (BFMOPA) --------
+                _t_phase = get_clock_us();
                 pac_sme_page_scores(
                     packed_q[n], packed_k, page_scores, token_tiles);
+                _t_s += get_clock_us() - _t_phase;
 
+                // -------- SVE Postprocess --------
+                _t_phase = get_clock_us();
                 const float *row_weights = weight_ptr + row * num_heads;
                 float *out = output_ptr + row * max_model_len + token_base;
                 const svbool_t all = svptrue_b32();
@@ -234,8 +269,21 @@ inline void indexer_bf16_paged_mqa_logits(
                         svwhilelt_b32(uint64_t(0), uint64_t(tile_valid));
                     svst1_f32(store_pg, out + tb * 16, result);
                 }
+                _t_p += get_clock_us() - _t_phase;
             }
         }
+
+        // Accumulate into thread's profiler slot
+        if (phase_timing) {
+            int64_t _tid = omp_get_thread_num();
+            phase_timing[_tid].q_pack_us += _t_q;
+            phase_timing[_tid].k_pack_us += _t_k;
+            phase_timing[_tid].sme_us += _t_s;
+            phase_timing[_tid].postprocess_us += _t_p;
+            phase_timing[_tid].mask_us += _t_m;
+            phase_timing[_tid].total_us += get_clock_us() - _t_batch_start;
+        }
+
 #else
         for (int64_t n = 0; n < next_n; ++n) {
             const int64_t row = batch_idx * next_n + n;

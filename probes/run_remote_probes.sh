@@ -19,7 +19,7 @@ run_probe()
     fi
 
     echo "===== $name: relevant instructions ====="
-    objdump -d "$OUT_DIR/$name" | grep -E -i 'bfdot|bfmopa|smstart|smstop|zero[[:space:]].*za' || true
+    objdump -d "$OUT_DIR/$name" | grep -E -i 'bfdot|bfmopa|smstart|smstop|cntw|zero.*za|mova|ld1w|st1w' || true
     echo "===== $name: run ====="
     "$OUT_DIR/$name"
     echo
@@ -29,3 +29,4 @@ echo "Compiler: $($CXX --version | head -n 1)"
 run_probe arm_features probe_arm_features.cpp
 run_probe sve_bf16 probe_sve_bf16.cpp
 run_probe sme_bfmopa probe_sme_bfmopa.cpp
+run_probe sme_k_transpose probe_sme_k_transpose.cpp

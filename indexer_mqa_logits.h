@@ -37,6 +37,9 @@ extern "C" void pac_sme_page_scores(
     float *scores, int64_t token_tiles);
 extern "C" void pac_sme_pack_k_page(
     const bfloat16_t *source, bfloat16_t *packed);
+extern "C" void pac_sme_pack_k_page_and_scores(
+    const bfloat16_t *source, bfloat16_t *packed,
+    const bfloat16_t *packed_q, float *scores, int64_t token_tiles);
 
 asm(R"(
     .arch armv9-a+sme+sve2
@@ -51,6 +54,7 @@ pac_sme_page_scores:
     stp d12, d13, [sp, #32]
     stp d14, d15, [sp, #48]
     smstart
+.Lpac_scores_streaming:
     ptrue p0.h
     ptrue p1.h
     ptrue p2.s
@@ -114,6 +118,10 @@ pac_sme_pack_k_page:
     stp d12, d13, [sp, #32]
     stp d14, d15, [sp, #48]
     smstart
+    adr x10, .Lpac_pack_only_done
+    b .Lpac_pack_streaming
+
+.Lpac_pack_streaming:
     ptrue p0.s
     mov x2, #4
     mov x8, x0
@@ -149,6 +157,9 @@ pac_sme_pack_k_page:
     add x9, x9, #4096
     subs x2, x2, #1
     b.ne 4b
+    br x10
+
+.Lpac_pack_only_done:
     smstop
     ldp d8, d9, [sp], #16
     ldp d10, d11, [sp], #16
@@ -156,6 +167,29 @@ pac_sme_pack_k_page:
     ldp d14, d15, [sp], #16
     ret
     .size pac_sme_pack_k_page, .-pac_sme_pack_k_page
+
+    .align 4
+    .global pac_sme_pack_k_page_and_scores
+    .type pac_sme_pack_k_page_and_scores, %function
+pac_sme_pack_k_page_and_scores:
+    sub sp, sp, #64
+    stp d8, d9, [sp, #0]
+    stp d10, d11, [sp, #16]
+    stp d12, d13, [sp, #32]
+    stp d14, d15, [sp, #48]
+    mov x13, x2
+    mov x14, x3
+    mov x15, x4
+    smstart
+    adr x10, .Lpac_pack_and_scores_done
+    b .Lpac_pack_streaming
+
+.Lpac_pack_and_scores_done:
+    mov x0, x13
+    mov x2, x14
+    mov x3, x15
+    b .Lpac_scores_streaming
+    .size pac_sme_pack_k_page_and_scores, .-pac_sme_pack_k_page_and_scores
 )");
 
 struct PacMqaPackedQWorkspace {
@@ -340,33 +374,14 @@ inline void indexer_bf16_paged_mqa_logits(
 
             const bfloat16_t *k_page =
                 kv_ptr + physical_block * block_size * dim;
-            const int64_t num_blocks =
-                page_offsets[batch_idx + 1] - page_offsets[batch_idx];
-            if (logical_block + 1 < num_blocks) {
-                const int64_t next_physical_block = block_table_ptr[
-                    batch_idx * max_num_blocks + logical_block + 1];
-                if (next_physical_block >= 0) {
-                    const bfloat16_t *next_page =
-                        kv_ptr + next_physical_block * block_size * dim;
-                    __builtin_prefetch(next_page + 0 * 1024, 0, 2);
-                    __builtin_prefetch(next_page + 1 * 1024, 0, 2);
-                    __builtin_prefetch(next_page + 2 * 1024, 0, 2);
-                    __builtin_prefetch(next_page + 3 * 1024, 0, 2);
-                    __builtin_prefetch(next_page + 4 * 1024, 0, 2);
-                    __builtin_prefetch(next_page + 5 * 1024, 0, 2);
-                    __builtin_prefetch(next_page + 6 * 1024, 0, 2);
-                    __builtin_prefetch(next_page + 7 * 1024, 0, 2);
-                }
-            }
 
 #ifdef EN_TIMING
             _t_phase = get_clock_us();
-#endif
             pac_sme_pack_k_page(k_page, packed_k);
-#ifdef EN_TIMING
             _t_k += get_clock_us() - _t_phase;
 #endif
 
+            bool packed_k_ready = false;
             for (int64_t n = 0; n < next_n; ++n) {
                 const int64_t row = batch_idx * next_n + n;
                 const int64_t q_limit = context_len - next_n + n;
@@ -382,33 +397,78 @@ inline void indexer_bf16_paged_mqa_logits(
 
 #ifdef EN_TIMING
                 _t_phase = get_clock_us();
-#endif
                 pac_sme_page_scores(
                     packed_q, packed_k, page_scores, token_tiles);
-#ifdef EN_TIMING
                 _t_s += get_clock_us() - _t_phase;
                 _t_phase = get_clock_us();
+#else
+                if (!packed_k_ready) {
+                    pac_sme_pack_k_page_and_scores(
+                        k_page, packed_k, packed_q,
+                        page_scores, token_tiles);
+                    packed_k_ready = true;
+                } else {
+                    pac_sme_page_scores(
+                        packed_q, packed_k, page_scores, token_tiles);
+                }
 #endif
                 const float *row_weights = weight_ptr + row * num_heads;
                 float *out =
                     output_ptr + row * max_model_len + token_base;
                 const svbool_t all = svptrue_b32();
                 const svfloat32_t zero = svdup_f32(0.0f);
-                for (int64_t tb = 0; tb < token_tiles; ++tb) {
-                    svfloat32_t result = zero;
+                if (token_tiles == 4) {
+                    svfloat32_t result0 = zero;
+                    svfloat32_t result1 = zero;
+                    svfloat32_t result2 = zero;
+                    svfloat32_t result3 = zero;
                     for (int64_t h = 0; h < 64; ++h) {
-                        const svfloat32_t score = svld1_f32(
-                            all, page_scores + h * 64 + tb * 16);
-                        const svfloat32_t activated =
-                            svmax_f32_x(all, score, zero);
-                        result = svmla_n_f32_x(
-                            all, result, activated, row_weights[h]);
+                        const float *scores = page_scores + h * 64;
+                        const svfloat32_t weight =
+                            svdup_f32(row_weights[h]);
+                        const svfloat32_t score0 =
+                            svld1_f32(all, scores + 0 * 16);
+                        const svfloat32_t score1 =
+                            svld1_f32(all, scores + 1 * 16);
+                        const svfloat32_t score2 =
+                            svld1_f32(all, scores + 2 * 16);
+                        const svfloat32_t score3 =
+                            svld1_f32(all, scores + 3 * 16);
+                        result0 = svmla_f32_x(
+                            all, result0,
+                            svmax_f32_x(all, score0, zero), weight);
+                        result1 = svmla_f32_x(
+                            all, result1,
+                            svmax_f32_x(all, score1, zero), weight);
+                        result2 = svmla_f32_x(
+                            all, result2,
+                            svmax_f32_x(all, score2, zero), weight);
+                        result3 = svmla_f32_x(
+                            all, result3,
+                            svmax_f32_x(all, score3, zero), weight);
                     }
-                    const int64_t tile_valid = std::min<int64_t>(
-                        16, valid_tokens - tb * 16);
-                    const svbool_t store_pg = svwhilelt_b32(
-                        uint64_t(0), uint64_t(tile_valid));
-                    svst1_f32(store_pg, out + tb * 16, result);
+                    svst1_f32(all, out + 0 * 16, result0);
+                    svst1_f32(all, out + 1 * 16, result1);
+                    svst1_f32(all, out + 2 * 16, result2);
+                    const svbool_t last_pg = svwhilelt_b32(
+                        uint64_t(48), uint64_t(valid_tokens));
+                    svst1_f32(last_pg, out + 3 * 16, result3);
+                } else {
+                    for (int64_t tb = 0; tb < token_tiles; ++tb) {
+                        svfloat32_t result = zero;
+                        for (int64_t h = 0; h < 64; ++h) {
+                            const svfloat32_t score = svld1_f32(
+                                all, page_scores + h * 64 + tb * 16);
+                            const svfloat32_t activated =
+                                svmax_f32_x(all, score, zero);
+                            result = svmla_n_f32_x(
+                                all, result, activated, row_weights[h]);
+                        }
+                        const svbool_t store_pg = svwhilelt_b32(
+                            uint64_t(0),
+                            uint64_t(valid_tokens - tb * 16));
+                        svst1_f32(store_pg, out + tb * 16, result);
+                    }
                 }
 #ifdef EN_TIMING
                 _t_p += get_clock_us() - _t_phase;

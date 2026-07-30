@@ -349,8 +349,8 @@ bfmopa za3.s, p0/m, p0/m, z3.h, z4.h
 BFMOPA 输入围绕相邻 K-pair 排列：
 
 ```text
-packed_q[k_pair][head_block][head][2]
-packed_k[token_block][k_pair][token][2]
+packed_q[4 k_pair][4 head_block][4 head][2 dim]
+packed_k[4 token_block][64 k_pair][16 token][2 dim]
 ```
 
 Q 每个 Query 打包一次并在全部 KV Page 间复用；K 每 Page 打包一次，Case 1 的两个 Query 共享该 K Packing。第一版将 ZA Tile 写入线程私有 `Score[64,64]`，再由 SVE 对 16 个 Token 并行执行：
@@ -532,4 +532,383 @@ Case 1 在一次测试中低于 V6、另一次略高于 V6；Case 2 两次均略
 
 精度检查通过。Case 1 提升约 0.86%，Case 2 提升约 0.15%，收益较小。这表明 LX2 对原始 Load/BFMOPA 循环已经具备较好的乱序调度能力，或者 SME 矩阵执行单元的 ZA 累加吞吐比 Load 延迟更接近当前瓶颈。双缓冲增加了寄存器使用和循环体尺寸，但没有产生明显负优化。
 
-但是，汇编代码的优化很困难且该收益很可能是波动，为了减少代码复杂度便于后续优化，目前使用V7版本
+但是，汇编代码的优化很困难且该收益很可能被运行波动覆盖。为了降低代码复杂度、便于后续优化，V8 的双缓冲实现已回退，后续版本继续建立在 V7 主线上。
+
+### 3.10 V9：使用 SME ZA 转置优化 K Packing
+
+#### 3.10.1 性能瓶颈
+
+阶段计时显示，V7 的主要剩余瓶颈已经从矩阵计算逐步转移到 K Packing：
+
+| 测试用例 | Q Pack | K Pack | SME | Postprocess | Mask Init |
+|---|---:|---:|---:|---:|---:|
+| Case 1 | 4.41% | 35.56% | 43.56% | 12.27% | 4.20% |
+| Case 2 | 0.98% | 54.47% | 35.00% | 9.11% | 0.44% |
+
+V4 的 SVE Gather 已经比标量复制快很多，但每个 16 KiB Page 仍需要：
+
+```text
+4 token blocks × 64 k-pairs
+= 256 次 16-lane Gather + 256 次连续 Store
+```
+
+Gather 的 16 个输入地址间隔 256 Bytes，加载延迟和地址生成成本较高。原始 K Page 实际上可以视为：
+
+```text
+K[64 tokens][64 BF16-pairs]
+```
+
+目标 Packed K 则是在每个 16-token Block 内进行 `16×16 uint32` 转置。因此可以把 ZA 同时作为矩阵寄存器和数据转置器使用。
+
+#### 3.10.2 ZA 转置方案
+
+每个 K Page 被拆成 16 个 `16×16 uint32` Tile。对每个 Tile：
+
+1. 使用 16 条连续 `ld1w {za0h.s[...]}`，将源矩阵的 16 行载入 ZA 横向 Slice；
+2. 使用 16 条连续 `st1w {za0v.s[...]}`，从 ZA 纵向 Slice 写出目标矩阵的 16 列；
+3. 整个过程只搬运 BF16 Pair 的原始 32-bit 位模式，不执行数值转换。
+
+完整 Page 的主体指令数量变为：
+
+```text
+256 次连续 512-bit Load + 256 次连续 512-bit Store
+```
+
+向量搬运条数与 Gather 版本相同，但输入端由 256 次离散 Gather 变为 256 次连续 ZA Slice Load，降低了地址生成和离散访存成本。
+
+独立探针在 LX2 上完成了逐元素布局校验：
+
+```text
+SME SVL: 512 bits
+PASS: SME K transpose matches gather packing
+hot-page gather: 2967.59 ns/page
+hot-page SME:     619.60 ns/page
+speedup:          4.790x
+```
+
+探针验证了以下真实指令：
+
+```asm
+smstart
+ld1w {za0h.s[w12, 0]}, p0/z, [x5, xzr, lsl #2]
+st1w {za0v.s[w12, 0]}, p0, [x6, xzr, lsl #2]
+smstop
+```
+
+接入算子时还需要遵守 AAPCS64：`smstart/smstop` 会影响向量寄存器状态，因此汇编函数在进入 Streaming Mode 前保存 `d8-d15`，退出后恢复。缺少该保护时，编译器保存在这些寄存器中的阶段计时累加器会被破坏，表现为 `denom == 0`；修复后阶段统计恢复正常。
+
+#### 3.10.3 完整算子结果
+
+接入后，阶段计时中 Case 1 的 K Packing 约降低 `0.01 ms`，Case 2 约降低 `0.10 ms`。整算子的六轮测试结果如下：
+
+| 轮次 | Case 1 | Case 2 |
+|---:|---:|---:|
+| 1 | 8.420979 TFLOPS | 7.568968 TFLOPS |
+| 2 | 8.535716 TFLOPS | 7.546321 TFLOPS |
+| 3 | 8.468822 TFLOPS | 7.552872 TFLOPS |
+| 4 | 8.457002 TFLOPS | 7.557757 TFLOPS |
+| 5 | 8.567334 TFLOPS | 5.991723 TFLOPS |
+| 6 | 5.300648 TFLOPS | 7.555746 TFLOPS |
+
+稳定样本的中位数与此前最快稳定版本对比如下：
+
+| 测试用例 | 此前最快版本 | V9 中位数 | 提升 |
+|---|---:|---:|---:|
+| Case 1 | 8.09 TFLOPS | 8.463 TFLOPS | 4.6% |
+| Case 2 | 6.80 TFLOPS | 7.554 TFLOPS | 11.1% |
+
+V9 的完整算子收益显著小于热页探针的 4.79 倍。这是因为探针重复处理常驻缓存的同一 Page，主要测量数据重排指令；完整算子还包含随机物理 Page 的冷缓存访问、多核共享缓存及内存带宽竞争，以及每 Page 的 Streaming Mode 切换。ZA 转置优化消除了大部分 Gather 指令成本，但无法消除 16 KiB 输入读取和 16 KiB Packed K 写入。
+
+#### 3.10.4 性能异常与风险
+
+六轮测试中出现两个孤立异常：Case 2 第 5 轮下降至 5.99 TFLOPS，Case 1 第 6 轮下降至 5.30 TFLOPS。异常发生在不同轮次和不同测试用例，同轮的另一个测试用例仍保持正常性能，因此目前没有证据表明它由固定输入触发的算法分支或确定性的 K Packing 路径造成。
+
+但由于此前版本未观察到同等幅度的下降，V9 暂时保留以下待验证风险：
+
+1. 频繁进入 SME Streaming Mode 是否放大了线程抢占或迁移的代价；
+2. OpenMP 线程是否始终固定在同一 NUMA 节点和同一组核心；
+3. 异常轮次的耗时是否集中在 K Packing、SME，还是整个算子所有阶段同步增加；
+4. 多核同时执行 ZA 转置时是否触发共享缓存或内存带宽的瞬时拥塞。
+
+后续应在固定 `OMP_NUM_THREADS`、`OMP_PROC_BIND`、`OMP_PLACES` 和 NUMA 绑定的条件下重复测试，并保留异常轮次的原始阶段计时。当前依据中位数判断，V9 相对稳定版本具有明确收益，予以保留。
+
+#### 3.10.5 删除 Packed K 的片上直算探索（未采纳）
+
+V9 之后曾尝试不落地 `packed_k`，直接把原始 K Page 分块装入 ZA，再通过 ZA Slice 与 Z 寄存器之间的数据移动完成 BFMOPA。独立探针首先验证了结果与物化 Packed K 完全一致，但逐 Tile 版本明显变慢：
+
+| 框架 | 耗时 | 吞吐 |
+|---|---:|---:|
+| 物化 Packed K | 647.40 ns/tile | 404.92 GFLOPS |
+| Direct K | 1012.52 ns/tile | 258.90 GFLOPS |
+
+进一步把多个 Tile 合并到一次 Streaming Mode 中，并批量复用寄存器后，Direct K 才与物化框架基本持平：
+
+| 框架 | 耗时 | 吞吐 |
+|---|---:|---:|
+| 物化 Packed K | 648.54 ns/tile | 404.21 GFLOPS |
+| Batched Direct K | 642.57 ns/tile | 407.96 GFLOPS |
+
+即使在热数据探针中，Direct K 的加速也仅为 `1.009x`。它没有提供足够余量抵消更复杂的寄存器调度、`next_n` 复用退化和边界处理成本，因此没有接入正式算子。该实验说明：在 LX2 上，`packed_k` 虽然占用显著时间，但它同时把后续 BFMOPA 所需的数据布局预先连续化；简单删除中间缓冲并不等价于删除这部分工作。
+
+### 3.11 V10：Page 级并行调度框架
+
+#### 3.11.1 原有调度的负载不均衡
+
+V9 及以前使用 OpenMP 按 Batch 静态并行：
+
+```cpp
+#pragma omp parallel for schedule(static)
+for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+    // 一个线程完成该 batch 的全部 pages
+}
+```
+
+设第 \(b\) 个 Batch 的上下文长度为 \(L_b\)，每个 Page 包含 64 个 Token，则它的 Page 数为
+$$
+N_b = \left\lceil \frac{L_b}{64} \right\rceil 
+$$
+若线程 \(t\) 获得的 Batch 集合为 \(\mathcal{B}_t\)，忽略边界 Page 的微小差异，其计算量近似为
+
+$$
+W_t \propto \sum_{b \in \mathcal{B}_t} N_b \cdot C_{\mathrm{page}}(\text{next\_n})
+$$
+由于各 Batch 的 `context_len` 存在波动，而 OpenMP 只保证每个线程获得相近数量的 Batch，并不保证 \(\sum N_b\) 相近，因此总耗时由 Page 最多的线程决定：
+
+$$
+T_{\mathrm{parallel}} \approx \max_t W_t
+$$
+Case 1 的 `batch_size=32`，最多只能自然使用 32 个线程；Case 2 虽然有 128 个 Batch，但每个线程只获得少数几个完整 Batch，随机长度差异仍会形成长尾。这使 38 核不能被充分利用。
+
+#### 3.11.2 Page 前缀和与等量切分
+
+V10 把并行任务的基本单位从 Batch 改为 Page。先构造 Page 前缀和：$P_0=0, \qquad P_{b+1}=P_b+N_b,$
+
+其中 \(P_B\) 是全部 Batch 的总 Page 数。对 \(T\) 个 OpenMP 线程，线程 \(t\) 处理全局 Page 区间
+
+$$
+s_t=\left\lfloor\frac{P_Bt}{T}\right\rfloor, \qquad
+e_t=\left\lfloor\frac{P_B(t+1)}{T}\right\rfloor
+$$
+因此任意两个线程的 Page 数量最多相差 1：
+
+$$
+\max_t(e_t-s_t)-\min_t(e_t-s_t)\le 1
+$$
+线程只在区间起点使用一次 `upper_bound`，由 \(s_t\) 定位起始 Batch 和 Batch 内 Page 编号，之后沿 Batch-major 顺序线性推进。该设计没有 OpenMP Task、原子计数器或动态任务队列，避免在每个 Page 上引入调度同步；同时连续 Page 区间仍保留较好的 Q 与 Page Table 局部性。
+
+按平均长度估算，两组用例的任务粒度为：
+
+| 测试用例 | 总 Page 数 | 38 线程下每线程 Page 数 |
+|---|---:|---:|
+| Case 1 | $32\times1024/64=512$ | 13--14 |
+| Case 2 | $128\times4096/64=8192$ | 215--216 |
+
+这使 Case 1 可以突破原先 32 个 Batch 带来的并行度上限，也基本消除了 Case 2 的 Batch 长度长尾。
+
+#### 3.11.3 两阶段单并行域
+
+Page 级并行要求任意线程都能读取任意 Batch 的 Packed Q。V10 因此把算子组织为同一个 OpenMP Parallel Region 内的两个阶段：
+
+1. **Q Packing 阶段**：所有线程用 `omp for` 并行生成共享的 `packed_q[batch][next_n]` 和 Mask；
+2. **Page 阶段**：利用 `omp for` 末尾的隐式 Barrier，保证 Packed Q 全部可见，然后每个线程执行自己的连续 Page 区间。
+
+共享 Packed Q 的容量为
+$$
+B\times N\times64\times128\times2\ \text{Bytes}
+$$
+即 Case 1 约 1 MiB、Case 2 约 2 MiB。该空间通过持久化 Workspace 复用，避免每次算子调用重复分配。`packed_k` 和 `page_scores` 仍为线程私有；对每个 Page，线程在同一核心上连续完成
+
+```text
+K Packing -> 所有 next_n 的 SME 点积 -> ReLU/Head Reduce -> 写回
+```
+
+因此 V10 只改变任务所有权和同步位置，不改变 V9 已验证的 K Packing、BFMOPA 及后处理数值路径。每个 Page 的输出区间互不重叠，不需要写入锁。
+
+#### 3.11.4 NUMA 绑定问题与修正
+
+初次使用 38 线程时，性能反而下降至约 6--7 TFLOPS。原因不是 Page 调度算法，而是运行脚本使用了：
+
+```bash
+taskset -c 1-38
+```
+
+CPU 编号区间两端均包含在内；当单 NUMA 节点的计算核心为 `0-37` 时，`1-38` 会漏掉 CPU 0，并错误包含相邻 NUMA 节点的 CPU 38。32 线程使用 `1-32` 时恰好没有越界，因而问题只在扩展到 38 线程后暴露。
+
+V10 的共享 Workspace 和输入内存具有明确 NUMA 归属。一旦某个工作线程跨节点，它既可能产生远程内存访问，也可能成为并行区最后完成的线程；由于壁钟时间取决于最慢线程，单个跨 NUMA 核就足以显著拉低整算子性能。将 CPU 集合修正为严格的 `0-37`，并固定
+
+
+```bash
+OMP_NUM_THREADS=38
+OMP_PROC_BIND=close
+```
+
+后，异常性能消失。该实验也证明，CPU/NUMA 亲和性错误确实能够造成与 V9 异常轮次同量级的性能暴跌；但 V9 当时是否使用了越界核心集合缺少记录，因此不能据此把 V9 的偶发波动直接归因于同一问题。
+
+V10 的核心收益不是提高单个 SME Kernel 的峰值吞吐，而是让更多核心持续执行有效 Page 工作。尤其在 Case 2 中，性能再次高于 Case 1，说明原先由 Batch 粒度造成的负载不均衡已被大幅消除；当前瓶颈重新集中到每个 Page 内部的 K 搬运、BFMOPA 计算和固定同步开销。
+
+### 3.12 V10x：V10 框架上的小粒度调优
+
+V10 完成 Page 级任务均衡后，继续大幅修改调度框架的收益与风险已经不匹配。V10x 因此保留 V10 的共享 Packed Q、Page 前缀和与 38 核静态切分，只优化每个 Page 都会重复执行的固定成本。V10x 包含三个彼此独立的小改动。
+
+#### 3.12.1 V10x.1：融合 K Packing 与第一个有效 Q
+
+V10 中，每个有效 Page 先调用 ZA 转置函数生成 Packed K，然后调用 BFMOPA 函数计算 Page Scores。分离路径需要经历两组函数序言、寄存器保护和 Streaming Mode 切换：
+
+```text
+保存 d8-d15
+smstart -> K Packing -> smstop
+恢复 d8-d15
+
+保存 d8-d15
+smstart -> BFMOPA -> smstop
+恢复 d8-d15
+```
+
+V10x.1 把 K Packing 主体与第一个有效 Q 的 BFMOPA 主体连接到同一个汇编入口：
+
+```text
+保存 d8-d15
+smstart -> K Packing -> BFMOPA -> smstop
+恢复 d8-d15
+```
+
+该改动消除了一次 `smstop -> smstart` 往返、一组 `d8-d15` 保存恢复和一次函数调用。Packed K 中间缓冲仍然保留，因此没有重复此前“删除 Page Scores”或 Direct K 方案的失败；当 `next_n=2` 时，第二个 Q 继续复用同一份 Packed K。
+
+实现不能简单假设 `n=0` 永远有效。当上下文长度刚好跨过 Page 边界时，最后一个 Page 可能对 `n=0` 没有有效 Token、但对 `n=1` 有效。因此代码使用 `packed_k_ready` 状态，由第一个满足 `valid_tokens>0` 的 Q 触发融合入口，保证尾 Page 语义正确。
+
+为了保留阶段 Profiler 中 K Packing 与 SME 的独立计时，`EN_TIMING` 构建继续使用分离路径；V10x.1 的真实性能必须通过关闭 Profiler 的正式构建测量。接入后，无 Profiler 性能稳定在约 `8.8--9.0 TFLOPS / 9.8--9.9 TFLOPS`，相对 V10 有明确提升。
+
+#### 3.12.2 V10x.2：删除无效的下一 Page 软件预取
+
+早期版本在处理当前 Page 前，对下一物理 Page 的 16 KiB K 数据抽样发出 8 条软件预取，每隔约 2 KiB 预取一条 64 Byte Cache Line。该方案只覆盖
+
+$$
+\frac{8\times64}{16\times1024}=3.125\%
+$$
+
+的下一 Page 数据，并且在 V10 的 38 核 Page 级并行框架下，每个线程已经沿连续的逻辑 Page 区间推进，原有预取的成本模型发生了变化。
+
+曾尝试把预取加强到 32 条、间隔缩短为 512 Bytes，使覆盖率提高到 12.5%。结果平均性能下降到约 `8.5 / 9.4 TFLOPS`，Profiler 中 Case 2 的 K Packing 反而增加约 `0.04 ms`。原因是 38 个核心同时发出大量 `PRFM`，增加了前端、地址生成、缓存填充队列和内存并发请求压力，而抽样预取仍不能替代对完整 16 KiB Page 的读取。
+
+随后进行了完全删除软件预取的 A/B 测试。10 轮测试的主体分布与 V10x.1 基本相同，并偶发达到 `9.00 / 10.00 TFLOPS`。这说明原来的 8 条预取没有可重复的正收益。V10x.2 最终删除该分支，以同等性能换取更短的 Page 热循环和更低的代码复杂度。
+
+#### 3.12.3 V10x.3：四 Token Tile 联合后处理
+
+每个 Page 的 SME 结果布局为：
+
+$$
+S\in\mathbb{R}^{64\times64},
+$$
+
+其中 64 行对应 Head，64 列对应 Token。后处理计算为
+
+$$
+O_t=\sum_{h=0}^{63}W_h\cdot\max(S_{h,t},0).
+$$
+
+SVE 每次处理 16 个 FP32 Token，因此完整 Page 被划分为 4 个 Token Tile。原循环以 Token Tile 为外层、Head 为内层：
+
+```text
+for tb in 0..3:
+    result[tb] = 0
+    for h in 0..63:
+        result[tb] += relu(scores[h][tb]) * weight[h]
+```
+
+完整 Page 中，每个 Head 权重会被加载或广播 4 次，总计
+
+$$
+4\times64=256
+$$
+
+次。V10x.3 将满 Page 改为 Head 外循环，并同时维护 4 个 SVE 累加器：
+
+```text
+result0, result1, result2, result3 = 0
+for h in 0..63:
+    weight = broadcast(weights[h])
+    result0 += relu(scores[h][0]) * weight
+    result1 += relu(scores[h][1]) * weight
+    result2 += relu(scores[h][2]) * weight
+    result3 += relu(scores[h][3]) * weight
+```
+
+权重加载或广播次数由 256 次降为 64 次，减少 75%；四条独立 FMA 依赖链也提高了指令级并行度。Page Scores 的读取次数、FMA 数量以及每个 Token 沿 Head 维的累加顺序均保持不变，因此不会引入新的数值误差来源。
+
+当 `token_tiles<4` 时，尾 Page 继续使用原循环；当第四个 Tile 只有部分有效 Token 时，使用 SVE Predicate 仅写回 `valid_tokens-48` 个结果。该优化接入后，实测性能达到：
+
+| 测试用例 | V10x.3 实测性能 |
+|---|---:|
+| Case 1 | 9.2 TFLOPS |
+| Case 2 | 10.01 TFLOPS |
+
+Case 2 首次在正确性通过的正式算子中越过 10 TFLOPS。由于当前单次测试仍存在约 1% 量级波动，`10.01 TFLOPS` 应视为目前最好实测值；是否稳定站上 10 TFLOPS 仍需通过更多轮次的中位数与最差值确认。
+
+#### 3.12.4 V10x 整体收益
+
+以 V10 无 Profiler 最好成绩 `8.6 / 9.5 TFLOPS` 为参照，V10x 当前最好成绩的提升为
+
+$$
+\frac{9.2}{8.6}-1=6.98\%,
+$$
+
+$$
+\frac{10.01}{9.5}-1=5.37\%.
+$$
+
+该比较是最好值之间的对比，并不等同于严格统计意义上的稳定加速；但三个改动分别消除了 Streaming Mode 往返、无效预取指令和重复权重广播，机制上相互独立，且最终性能提升已经明显超过此前约 1% 的运行波动。
+
+## 4. 阶段性总结
+
+### 4.1 性能演进
+
+从参考实现到 V10x，优化路径经历了算法分块、SVE 向量化、SME 矩阵化、数据重排优化和并行调度重构：
+
+| 版本 | 核心优化 | Case 1 | Case 2 |
+|---|---|---:|---:|
+| Baseline | 参考 Page/Head/Token/DIM 循环 | 0.0382 TFLOPS | 0.0424 TFLOPS |
+| V2 | SVE BF16 BFDOT | 0.641 TFLOPS | 0.730 TFLOPS |
+| V3 | SME BFMOPA Page 矩阵化 | 7.799 TFLOPS | 6.600 TFLOPS |
+| V6 | Q Packing 优化 | 8.025 TFLOPS | 6.794 TFLOPS |
+| V9 | SME ZA K Packing | 8.463 TFLOPS | 7.554 TFLOPS |
+| V10 | Page 级负载均衡与 38 核调度 | 8.6 TFLOPS | 9.5 TFLOPS |
+| V10x | 融合、删除预取、联合后处理 | **9.2 TFLOPS** | **10.01 TFLOPS** |
+
+相对 Baseline，当前最好成绩的累计加速约为
+
+$$
+\frac{9.2}{0.038219666}=240.7\times,
+$$
+
+$$
+\frac{10.01}{0.042419292}=236.0\times.
+$$
+
+### 4.2 主要经验
+
+1. **先改变算法数据流，再优化指令。** Page-by-Page 框架和矩阵化将 K Page 从重复读取对象变为可复用计算块，是百倍加速的基础。
+2. **数据布局与矩阵指令同等重要。** BFMOPA 提供高计算吞吐，但 Q/K Packing 一度占据 30%--50% 时间；ZA 转置和共享 Packed Q 决定了矩阵单元能否持续工作。
+3. **负载均衡必须以真实工作量为单位。** 固定测试规模并不代表每个 Batch 的 Page 数相同。按 Page 前缀和切分后，Case 2 的 32 至 38 核扩展效率接近理想值。
+4. **NUMA 与绑核是算法性能的一部分。** `taskset -c 1-38` 只错一个 CPU 编号，就能让性能下降数 TFLOPS；单 NUMA 节点必须严格绑定 `0-37`。
+5. **微基准收益不能直接外推到完整算子。** 热页 ZA 转置达到 4.79 倍，但整算子还受到冷数据、缓存竞争和内存带宽限制；Direct K 热探针的 1.009 倍也不足以支撑复杂重构。
+6. **中间缓冲不一定是浪费。** 两次删除 Page Scores、一次 Direct K 尝试都说明，中间布局可以换取规整访存、寄存器复用和更高矩阵吞吐。
+7. **预取不是越多越好。** 加强 Page 预取使 K Packing 明显变慢；软件预取只有在覆盖、提前量和硬件请求容量匹配时才有价值。
+8. **固定规模允许有针对性的寄存器分块。** 四 Token Tile 联合后处理利用了 `block_size=64` 与 SVE FP32 16 Lane 的固定关系，在不改变运算量的前提下减少权重广播并增加 ILP。
+
+### 4.3 当前瓶颈与后续方向
+
+V10x 已经解决了最明显的调度长尾和后处理重复广播。根据最近的 Profiler，主要时间仍集中在 K Packing 与 SME BFMOPA；下一项最有希望的方向是将 BFMOPA 从当前 `4 Head Block × 1 Token Block` 改为 `2 Head Block × 2 Token Block` 寄存器分块。
+
+对完整 Page，当前 BFMOPA 每个 K Pair 需要 4 个 Q Load 和 1 个 K Load，总向量加载数为
+
+$$
+4\times64\times(4+1)=1280.
+$$
+
+`2\times2` 分块每个 K Pair 需要 2 个 Q Load 和 2 个 K Load，总量为
+
+$$
+4\times64\times(2+2)=1024,
+$$
+
+理论上可减少 20% 的 BFMOPA 输入向量 Load，而 BFMOPA 数量和 Page Scores 布局不变。该改动依赖 SME 汇编寄存器映射，应先通过独立探针验证指令、布局和热 Tile 性能，再决定是否接入正式算子。

@@ -1,0 +1,97 @@
+1. 38 核纯 BFMOPA 峰值
+==== SME peak: inner instructions ====
+ 400cc8: 94000222  bl  401550 <sme_bfmopa_peak_2x2>
+0000000000401550 <sme_bfmopa_peak_2x2>:
+ 401564: d503477f  smstart
+ 401584: c00800ff  zero {za}
+ 401588: 81840000  bfmopa  za0.s, p0/m, p0/m, z0.h, z4.h
+ 40158c: 81850001  bfmopa  za1.s, p0/m, p0/m, z0.h, z5.h
+ 401590: 81840022  bfmopa  za2.s, p0/m, p0/m, z1.h, z4.h
+ 401594: 81850023  bfmopa  za3.s, p0/m, p0/m, z1.h, z5.h
+ 40159c: 54ffff61  b.ne  401588 <sme_bfmopa_peak_2x2+0x38>  // b.any
+ 4015d0: 54fffec3  b.cc  4015a8 <sme_bfmopa_peak_2x2+0x58>  // b.lo, b.ul, b.last
+ 4015d4: d503467f  smstop
+ 401648: 97fffc2  bl  401550 <sme_bfmopa_peak_2x2>
+ 401678: 97ffffb6  bl  401550 <sme_bfmopa_peak_2x2>
+ 4016c4: 97ffffa3  bl  401550 <sme_bfmopa_peak_2x2>
+==== SME peak: run ====
+SME SVL: 512 bits
+one‑step max abs error: 0
+PASS: four ZA tiles match the expected outer products
+threads=38 unique_cpus=38 cpu_range=0‑37
+run 1: 20.084 ms   38.749 TFLOPS
+run 2: 20.135 ms   38.651 TFLOPS
+run 3: 20.059 ms   38.798 TFLOPS
+run 4: 20.854 ms   37.319 TFLOPS
+run 5: 20.268 ms   38.398 TFLOPS
+run 6: 20.034 ms   38.847 TFLOPS
+run 7: 20.885 ms   37.263 TFLOPS
+SME peak median: 38.651 TFLOPS
+SME peak best:    38.847 TFLOPS
+
+2. 带宽
+==== Random‑page bandwidth: compile ====
+==== Random‑page bandwidth: run ====
+threads=38 unique_cpus=38 cpu_range=0‑37
+main_cpu=0 cpu_node=0 bound_memory_node=16
+dataset=512.0 MiB pages=32768 passes=8 payload=4.0 GiB/run
+sequential pages + linear cache lines:
+  run 1: 11.199 ms   383.52 GB/s
+  run 2: 11.155 ms   385.03 GB/s
+  run 3: 11.175 ms   384.32 GB/s
+  run 4: 11.209 ms   383.17 GB/s
+  run 5: 11.095 ms   387.12 GB/s
+  run 6: 11.040 ms   389.04 GB/s
+  run 7: 10.979 ms   391.21 GB/s
+  median: 385.03 GB/s
+  best:    391.21 GB/s
+  checksum: 0x0000000004000000
+random pages + K‑pack access order:
+  run 1: 20.804 ms   206.45 GB/s
+  run 2: 20.824 ms   206.25 GB/s
+  run 3: 23.159 ms   185.46 GB/s
+  run 4: 20.661 ms   207.88 GB/s
+  run 5: 20.900 ms   205.50 GB/s
+  run 6: 20.897 ms   205.53 GB/s
+  run 7: 20.747 ms   207.02 GB/s
+  median: 206.25 GB/s
+  best:    207.88 GB/s
+  checksum: 0x0000000004000000
+Case1 compulsory‑K roof: 26.400 TFLOPS
+Case2 compulsory‑K roof: 13.200 TFLOPS
+
+3. 最新版本profiler
+
+Total Number of Testcases: 2
+================================================================================
+Running on Testcase 1:
+Parameters: batch_size = 32, next_n = 2, avg_kv = 1024
+cos_diff: 2.220446e‑14
+Performance: 8.388726 TFLOPS
+AvgTime: 127.743152 us
+
+Phase Timing Profile:
+| Q Pack          0.02ms  13.96%
+| K Pack          0.04ms  28.08%
+| SME             0.06ms  43.08%
+| Postprocess     0.01ms   9.34%
+| Mask Init       0.01ms   5.54%
+‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑
+| Overhead        0.02ms  13.09%  (prefetch, branch, etc.)
+================================================================================
+Running on Testcase 2:
+Parameters: batch_size = 128, next_n = 1, avg_kv = 4096
+cos_diff: 5.007106e‑14
+Performance: 9.417427 TFLOPS
+AvgTime: 916.709830 us
+
+Phase Timing Profile:
+| Q Pack          0.01ms   1.12%
+| K Pack          0.47ms  51.22%
+| SME             0.35ms  38.55%
+| Postprocess     0.08ms   8.36%
+| Mask Init       0.01ms   0.75%
+‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑
+| Overhead        0.05ms   5.08%  (prefetch, branch, etc.)
+================================================================================
+All Tests Ends

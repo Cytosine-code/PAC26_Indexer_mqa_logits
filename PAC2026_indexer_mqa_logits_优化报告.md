@@ -748,7 +748,7 @@ V10 的核心收益不是提高单个 SME Kernel 的峰值吞吐，而是让更�
 
 ### 3.12 V10x：V10 框架上的小粒度调优
 
-V10 完成 Page 级任务均衡后，继续大幅修改调度框架的收益与风险已经不匹配。V10x 因此保留 V10 的共享 Packed Q、Page 前缀和与 38 核静态切分，只优化每个 Page 都会重复执行的固定成本。V10x 包含三个彼此独立的小改动。
+V10 完成 Page 级任务均衡后，继续大幅修改调度框架的收益与风险已经不匹配。V10x 因此保留 V10 的共享 Packed Q、Page 前缀和与 38 核静态切分，只优化每个 Page 都会重复执行的固定成本。V10x 初始包含三个彼此独立的小改动，随后又加入满 Page `2×2 BFMOPA` 寄存器分块。
 
 #### 3.12.1 V10x.1：融合 K Packing 与第一个有效 Q
 
@@ -844,19 +844,53 @@ for h in 0..63:
 
 Case 2 首次在正确性通过的正式算子中越过 10 TFLOPS。由于当前单次测试仍存在约 1% 量级波动，`10.01 TFLOPS` 应视为目前最好实测值；是否稳定站上 10 TFLOPS 仍需通过更多轮次的中位数与最差值确认。
 
-#### 3.12.4 V10x 整体收益
+#### 3.12.4 V10x.4：满 Page 2×2 BFMOPA
 
-以 V10 无 Profiler 最好成绩 `8.6 / 9.5 TFLOPS` 为参照，V10x 当前最好成绩的提升为
+原 BFMOPA 内核使用 `4 Head Block × 1 Token Block` 分块。每个 K Pair 需要加载 4 个 Q 向量和 1 个 K 向量；完整 Page 的输入向量加载数为
+
+$$
+4\times64\times(4+1)=1280.
+$$
+
+新内核将四个 ZA Tile 映射为 `2 Head Block × 2 Token Block`：
+
+```text
+ZA0 = Head A × Token A
+ZA1 = Head A × Token B
+ZA2 = Head B × Token A
+ZA3 = Head B × Token B
+```
+
+每个 K Pair 只需加载 2 个 Q 向量和 2 个 K 向量，完整 Page 的输入向量加载数变为
+
+$$
+4\times64\times(2+2)=1024,
+$$
+
+减少 20%。BFMOPA 数量仍为每 Page/Query 1024 条，每个输出 Tile 沿 K 维的累加顺序也保持不变。满 64 Token Page 使用新内核，尾 Page 继续使用已验证的 `4×1` 内核；第一个满 Page Q 仍与 K Packing 共用一次 Streaming Mode。
+
+由于测试期间机器整体性能较先前下降，采用同一机器状态下重新测试的旧版本作为基线：
+
+| 测试用例 | 2×2 前 | 2×2 后 | 同机提升 |
+|---|---:|---:|---:|
+| Case 1 | 8.523 TFLOPS | 8.929 TFLOPS | 4.76% |
+| Case 2 | 9.444 TFLOPS | 10.178 TFLOPS | 7.77% |
+
+该结果证明 2×2 分块减少的 Load 指令确实位于关键路径。Case 2 满 Page 比例更高、运行时间更长，因此获得了更充分的稳态收益。
+
+#### 3.12.5 V10x 整体收益
+
+以 V10 无 Profiler 最好成绩 `8.6 / 9.5 TFLOPS` 为历史参照，V10x 目前记录到的最好成绩为 `9.2 / 10.178 TFLOPS`，最好值之间的提升为
 
 $$
 \frac{9.2}{8.6}-1=6.98\%,
 $$
 
 $$
-\frac{10.01}{9.5}-1=5.37\%.
+\frac{10.178}{9.5}-1=7.14\%.
 $$
 
-该比较是最好值之间的对比，并不等同于严格统计意义上的稳定加速；但三个改动分别消除了 Streaming Mode 往返、无效预取指令和重复权重广播，机制上相互独立，且最终性能提升已经明显超过此前约 1% 的运行波动。
+该比较是跨机器状态的最好值对比，并不等同于严格统计意义上的稳定加速。2×2 BFMOPA 的收益应以同机 `4.76% / 7.77%` 为准；其余改动分别消除了 Streaming Mode 往返、无效预取指令和重复权重广播，机制上相互独立。
 
 ## 4. 阶段性总结
 
@@ -872,7 +906,7 @@ $$
 | V6 | Q Packing 优化 | 8.025 TFLOPS | 6.794 TFLOPS |
 | V9 | SME ZA K Packing | 8.463 TFLOPS | 7.554 TFLOPS |
 | V10 | Page 级负载均衡与 38 核调度 | 8.6 TFLOPS | 9.5 TFLOPS |
-| V10x | 融合、删除预取、联合后处理 | **9.2 TFLOPS** | **10.01 TFLOPS** |
+| V10x | 融合、删除预取、联合后处理、2×2 BFMOPA | **9.2 TFLOPS** | **10.178 TFLOPS** |
 
 相对 Baseline，当前最好成绩的累计加速约为
 
@@ -881,7 +915,7 @@ $$
 $$
 
 $$
-\frac{10.01}{0.042419292}=236.0\times.
+\frac{10.178}{0.042419292}=239.9\times.
 $$
 
 ### 4.2 主要经验
@@ -895,20 +929,156 @@ $$
 7. **预取不是越多越好。** 加强 Page 预取使 K Packing 明显变慢；软件预取只有在覆盖、提前量和硬件请求容量匹配时才有价值。
 8. **固定规模允许有针对性的寄存器分块。** 四 Token Tile 联合后处理利用了 `block_size=64` 与 SVE FP32 16 Lane 的固定关系，在不改变运算量的前提下减少权重广播并增加 ILP。
 
-### 4.3 当前瓶颈与后续方向
+### 4.3 单 NUMA 真实 SME 峰值
 
-V10x 已经解决了最明显的调度长尾和后处理重复广播。根据最近的 Profiler，主要时间仍集中在 K Packing 与 SME BFMOPA；下一项最有希望的方向是将 BFMOPA 从当前 `4 Head Block × 1 Token Block` 改为 `2 Head Block × 2 Token Block` 寄存器分块。
+公开资料中的整颗 304 核 CPU BF16 算力约为 240 TFLOPS，按 8 个 38 核簇平均只能得到约 30 TFLOPS。为了避免不同频率和测试口径造成误判，使用 38 核纯 BFMOPA 探针实测当前节点。
 
-对完整 Page，当前 BFMOPA 每个 K Pair 需要 4 个 Q Load 和 1 个 K Load，总向量加载数为
+探针在每个线程的一次 `smstart` 内把四个操作数常驻 Z 寄存器，循环执行：
+
+```asm
+bfmopa za0.s, ..., z0.h, z4.h
+bfmopa za1.s, ..., z0.h, z5.h
+bfmopa za2.s, ..., z1.h, z4.h
+bfmopa za3.s, ..., z1.h, z5.h
+```
+
+一条 512-bit BFMOPA 完成 1024 FLOPs，每轮四条，因此 38 线程、每线程 5,000,000 轮的总计算量为
 
 $$
-4\times64\times(4+1)=1280.
+38\times5{,}000{,}000\times4\times1024
+=778.24\text{ GFLOPs}.
 $$
 
-`2\times2` 分块每个 K Pair 需要 2 个 Q Load 和 2 个 K Load，总量为
+探针完成四个 ZA Tile 的逐元素校验，并确认 38 个线程分别绑定在 CPU `0-37`。七轮结果为：
+
+| 指标 | 实测结果 |
+|---|---:|
+| 中位数 | 38.651 TFLOPS |
+| 最好值 | 38.847 TFLOPS |
+
+该结果与 2.0 GHz 下每核约每两周期发射一条 BFMOPA 的理论值吻合：
 
 $$
-4\times64\times(2+2)=1024,
+38\times2\text{ GHz}\times
+\frac{1024\text{ FLOPs}}{2\text{ cycles}}
+=38.912\text{ TFLOPS}.
 $$
 
-理论上可减少 20% 的 BFMOPA 输入向量 Load，而 BFMOPA 数量和 Page Scores 布局不变。该改动依赖 SME 汇编寄存器映射，应先通过独立探针验证指令、布局和热 Tile 性能，再决定是否接入正式算子。
+实测中位数达到该值的 99.3%，因此本报告采用
+
+$$
+P_{\mathrm{SME}}=38.651\text{ TFLOPS}
+$$
+
+作为单 NUMA 的真实纯 BFMOPA 峰值。该峰值不包含操作数 Load、ZA Store、Packing、后处理和 Streaming Mode 切换，不能直接视为完整算子上限。
+
+### 4.4 随机 K Page 有效带宽
+
+带宽探针复现正式算子的关键条件：
+
+1. 使用 512 MiB 数据集，远大于 38 核合计约 29 MiB L2；
+2. CPU 固定为 `0-37`；
+3. 按正式 Allocator 规则将数据绑定到 Memory Node 16；
+4. 将 32768 个 16 KiB Page 随机排列，各线程读取互不重叠的 Page；
+5. Page 内按 ZA K Packing 的真实次序访问。
+
+Page 内地址为
+
+$$
+\mathrm{offset}
+=tb\times4096+column\times64+row\times256,
+$$
+
+其中 `tb=0..3`、`column=0..3`、`row=0..15`。它恰好覆盖 16 KiB Page 的全部 256 条 64 Byte Cache Line，各访问一次。
+
+| 访问方式 | 中位带宽 | 最好带宽 |
+|---|---:|---:|
+| 连续 Page + 连续 Cache Line | 385.03 GB/s | 391.21 GB/s |
+| 随机 Page + K Packing 次序 | 206.25 GB/s | 207.88 GB/s |
+
+随机 Page 结果只有连续读取的 53.6%，说明 Block Table 随机化和 Page 内跨行访问显著降低了内存系统效率。探针为了保证所有 Load 可观察，还包含 SVE XOR 归约和地址循环，因此 206.25 GB/s 应理解为该访问模式的有效读取吞吐，而不是纯 DRAM 物理峰值。
+
+### 4.5 Case 1 的 128 FLOP/Byte 来源
+
+Roofline 使用
+
+$$
+P_{\mathrm{BW}}=I\times B,
+$$
+
+其中 \(I\) 是算术强度，单位为 FLOP/Byte；\(B\) 是 GB/s。两者相乘先得到 GFLOPS，再除以 1000 得到 TFLOPS。
+
+一个完整 K Page 包含 64 个 Token，每个 Token 有 128 个 BF16 元素，因此强制读取量为
+
+$$
+D_K=64\times128\times2
+=16{,}384\text{ Bytes}.
+$$
+
+一个 Q 对该 Page 的 64 Head 点积计算量为
+
+$$
+F_{1Q}=2\times64_{\mathrm{heads}}
+\times64_{\mathrm{tokens}}\times128_{\mathrm{dim}}
+=1{,}048{,}576\text{ FLOPs}.
+$$
+
+Case 2 的 `next_n=1`，同一个 K Page 只服务一个 Q，所以
+
+$$
+I_{\mathrm{Case2}}
+=\frac{F_{1Q}}{D_K}
+=\frac{1{,}048{,}576}{16{,}384}
+=64\text{ FLOP/Byte}.
+$$
+
+Case 1 的 `next_n=2`。当前框架只读取并 Packing 一次 K Page，然后让两个 Q 复用它，因此读取相同的 16 KiB K 可以完成两份点积：
+
+$$
+F_{2Q}=2\times F_{1Q}=2{,}097{,}152\text{ FLOPs},
+$$
+
+$$
+I_{\mathrm{Case1}}
+=\frac{F_{2Q}}{D_K}
+=\frac{2{,}097{,}152}{16{,}384}
+=128\text{ FLOP/Byte}.
+$$
+
+也可以从单个 BF16 K 元素理解：它占 2 Bytes；对每个 Q，它与 64 个 Head 分别执行一次乘加，即 \(64\times2=128\) FLOPs；Case 1 有两个 Q，因此每 2 Bytes K 产生 256 FLOPs，仍然是 128 FLOP/Byte。
+
+代入随机 Page 有效带宽：
+
+$$
+P_{\mathrm{BW,Case1}}
+=128\times206.25
+=26{,}400\text{ GFLOPS}
+=26.40\text{ TFLOPS},
+$$
+
+$$
+P_{\mathrm{BW,Case2}}
+=64\times206.25
+=13{,}200\text{ GFLOPS}
+=13.20\text{ TFLOPS}.
+$$
+
+这里的算术强度按完整 Page 和题目计分 FLOPs 估算。尾 Page 仍读取完整 16 KiB、但有效 Token 少于 64，因此真实平均算术强度会略低。更重要的是，上述带宽 Roofline 只计算不可避免的原始 K 读取，没有扣除 Packed K、Page Scores、FP32 后处理和同步，是乐观上限而非性能预测。
+
+### 4.6 当前 Roofline 位置
+
+结合真实 SME 峰值与随机 K Page 带宽：
+
+$$
+P_{\mathrm{roof}}
+=\min(P_{\mathrm{SME}},P_{\mathrm{BW}}).
+$$
+
+| 测试用例 | SME Roof | K 带宽 Roof | 算子 Roofline | 当前无 Profiler | Roof 利用率 |
+|---|---:|---:|---:|---:|---:|
+| Case 1 | 38.651T | 26.40T | 26.40T | 8.929T | 33.8% |
+| Case 2 | 38.651T | 13.20T | 13.20T | 10.178T | 77.1% |
+
+Case 2 已明显进入随机 K Page 带宽受限区。13.20 TFLOPS 没有包含其它必要工作，因此当前框架更现实的目标是稳定达到约 11--12 TFLOPS，而不是接近 38.651 TFLOPS。
+
+Case 1 的 26.40 TFLOPS 是长时间稳态下的乐观上限。实际 Case 1 只有约 128 us，每线程仅处理约 13--14 个 Page，内存和 SME 很难进入长时间稳态；Q Packing、全局 Barrier、第二个 Q 的调用以及固定启动成本占比更高，因此不能由 33.8% 的 Roof 利用率推断存在三倍可提取空间。

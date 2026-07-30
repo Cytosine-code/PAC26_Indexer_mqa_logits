@@ -35,11 +35,17 @@ struct MqaLogitsPhaseTiming {
 extern "C" void pac_sme_page_scores(
     const bfloat16_t *packed_q, const bfloat16_t *packed_k,
     float *scores, int64_t token_tiles);
+extern "C" void pac_sme_page_scores_2x2(
+    const bfloat16_t *packed_q, const bfloat16_t *packed_k,
+    float *scores);
 extern "C" void pac_sme_pack_k_page(
     const bfloat16_t *source, bfloat16_t *packed);
 extern "C" void pac_sme_pack_k_page_and_scores(
     const bfloat16_t *source, bfloat16_t *packed,
     const bfloat16_t *packed_q, float *scores, int64_t token_tiles);
+extern "C" void pac_sme_pack_k_page_and_scores_2x2(
+    const bfloat16_t *source, bfloat16_t *packed,
+    const bfloat16_t *packed_q, float *scores);
 
 asm(R"(
     .arch armv9-a+sme+sve2
@@ -107,6 +113,87 @@ pac_sme_page_scores:
     ldp d14, d15, [sp], #16
     ret
     .size pac_sme_page_scores, .-pac_sme_page_scores
+
+    .align 4
+    .global pac_sme_page_scores_2x2
+    .type pac_sme_page_scores_2x2, %function
+pac_sme_page_scores_2x2:
+    sub sp, sp, #64
+    stp d8, d9, [sp, #0]
+    stp d10, d11, [sp, #16]
+    stp d12, d13, [sp, #32]
+    stp d14, d15, [sp, #48]
+    smstart
+
+.Lpac_scores_2x2_streaming:
+    ptrue p0.h
+    ptrue p1.h
+    ptrue p2.s
+    mov x16, #2
+    mov x17, x1
+
+.Lpac_scores_2x2_heads:
+    mov x13, #2
+    mov x14, x17
+    mov x15, x2
+
+.Lpac_scores_2x2_tokens:
+    zero {za}
+    mov x4, x0
+    mov x5, x14
+    add x6, x14, #1, lsl #12
+    mov x7, #64
+
+.Lpac_scores_2x2_k:
+    ld1h {z0.h}, p1/z, [x4]
+    ld1h {z1.h}, p1/z, [x4, #1, mul vl]
+    ld1h {z4.h}, p1/z, [x5]
+    ld1h {z5.h}, p1/z, [x6]
+    bfmopa za0.s, p0/m, p0/m, z0.h, z4.h
+    bfmopa za1.s, p0/m, p0/m, z0.h, z5.h
+    bfmopa za2.s, p0/m, p0/m, z1.h, z4.h
+    bfmopa za3.s, p0/m, p0/m, z1.h, z5.h
+    add x4, x4, #256
+    add x5, x5, #64
+    add x6, x6, #64
+    subs x7, x7, #1
+    b.ne .Lpac_scores_2x2_k
+
+    mov x8, x15
+    add x9, x8, #64
+    add x10, x8, #1, lsl #12
+    add x11, x10, #64
+    mov w12, #0
+.Lpac_scores_2x2_store:
+    st1w {za0h.s[w12, 0]}, p2, [x8]
+    st1w {za1h.s[w12, 0]}, p2, [x9]
+    st1w {za2h.s[w12, 0]}, p2, [x10]
+    st1w {za3h.s[w12, 0]}, p2, [x11]
+    add x8, x8, #256
+    add x9, x9, #256
+    add x10, x10, #256
+    add x11, x11, #256
+    add w12, w12, #1
+    cmp w12, #16
+    b.lo .Lpac_scores_2x2_store
+
+    add x14, x14, #2, lsl #12
+    add x15, x15, #128
+    subs x13, x13, #1
+    b.ne .Lpac_scores_2x2_tokens
+
+    add x0, x0, #128
+    add x2, x2, #2, lsl #12
+    subs x16, x16, #1
+    b.ne .Lpac_scores_2x2_heads
+
+    smstop
+    ldp d8, d9, [sp], #16
+    ldp d10, d11, [sp], #16
+    ldp d12, d13, [sp], #16
+    ldp d14, d15, [sp], #16
+    ret
+    .size pac_sme_page_scores_2x2, .-pac_sme_page_scores_2x2
 
     .align 4
     .global pac_sme_pack_k_page
@@ -190,6 +277,27 @@ pac_sme_pack_k_page_and_scores:
     mov x3, x15
     b .Lpac_scores_streaming
     .size pac_sme_pack_k_page_and_scores, .-pac_sme_pack_k_page_and_scores
+
+    .align 4
+    .global pac_sme_pack_k_page_and_scores_2x2
+    .type pac_sme_pack_k_page_and_scores_2x2, %function
+pac_sme_pack_k_page_and_scores_2x2:
+    sub sp, sp, #64
+    stp d8, d9, [sp, #0]
+    stp d10, d11, [sp, #16]
+    stp d12, d13, [sp, #32]
+    stp d14, d15, [sp, #48]
+    mov x13, x2
+    mov x14, x3
+    smstart
+    adr x10, .Lpac_pack_and_scores_2x2_done
+    b .Lpac_pack_streaming
+
+.Lpac_pack_and_scores_2x2_done:
+    mov x0, x13
+    mov x2, x14
+    b .Lpac_scores_2x2_streaming
+    .size pac_sme_pack_k_page_and_scores_2x2, .-pac_sme_pack_k_page_and_scores_2x2
 )");
 
 struct PacMqaPackedQWorkspace {
@@ -397,19 +505,35 @@ inline void indexer_bf16_paged_mqa_logits(
 
 #ifdef EN_TIMING
                 _t_phase = get_clock_us();
-                pac_sme_page_scores(
-                    packed_q, packed_k, page_scores, token_tiles);
+                if (valid_tokens == 64) {
+                    pac_sme_page_scores_2x2(
+                        packed_q, packed_k, page_scores);
+                } else {
+                    pac_sme_page_scores(
+                        packed_q, packed_k, page_scores, token_tiles);
+                }
                 _t_s += get_clock_us() - _t_phase;
                 _t_phase = get_clock_us();
 #else
                 if (!packed_k_ready) {
-                    pac_sme_pack_k_page_and_scores(
-                        k_page, packed_k, packed_q,
-                        page_scores, token_tiles);
+                    if (valid_tokens == 64) {
+                        pac_sme_pack_k_page_and_scores_2x2(
+                            k_page, packed_k, packed_q, page_scores);
+                    } else {
+                        pac_sme_pack_k_page_and_scores(
+                            k_page, packed_k, packed_q,
+                            page_scores, token_tiles);
+                    }
                     packed_k_ready = true;
                 } else {
-                    pac_sme_page_scores(
-                        packed_q, packed_k, page_scores, token_tiles);
+                    if (valid_tokens == 64) {
+                        pac_sme_page_scores_2x2(
+                            packed_q, packed_k, page_scores);
+                    } else {
+                        pac_sme_page_scores(
+                            packed_q, packed_k,
+                            page_scores, token_tiles);
+                    }
                 }
 #endif
                 const float *row_weights = weight_ptr + row * num_heads;

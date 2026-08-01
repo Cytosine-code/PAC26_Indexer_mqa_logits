@@ -26,6 +26,8 @@ LX2芯片，详细请参考目录下SVEconfig.md，只能使用单numa节点38�
 - 远程 ARM：`g++ -O3 -march=armv9-a+sme+sve2 -fopenmp -lnuma main.cpp -o main`
 - `#ifdef __aarch64__` 隔离 ARM/x86 路径，本地用 `-I./x86_compat`
 
+- 远程项目与本项目唯一区别是远端失误写成probe/本地是probes
+
 ### 赛题记忆
 
 为防止你忘掉上下文如环境等配置，可以参考以下内容：

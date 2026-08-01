@@ -892,6 +892,44 @@ $$
 
 该比较是跨机器状态的最好值对比，并不等同于严格统计意义上的稳定加速。2×2 BFMOPA 的收益应以同机 `4.76% / 7.77%` 为准；其余改动分别消除了 Streaming Mode 往返、无效预取指令和重复权重广播，机制上相互独立。
 
+### 3.13 使用 KUPL 调用层（未采纳）
+
+#### 3.13.1 动机
+
+Phase Timing 中 Case 1 的 Overhead 占比约 13%，主要来自每次算子调用重建 OpenMP region（约 9.4 μs）以及 Q Pack 与 Page 阶段之间的全局 barrier。KUPL 的 `kupl_parallel_for` 单次启动开销约 5.5 μs，预探针确认可以替代 OpenMP 调度层。因此尝试把调度层整体替换为 KUPL，计算主内核保持不变，专门验证调度差异。
+
+#### 3.13.2 实现方案
+
+计算路径（手写 SME 2×2 BFMOPA、ZA K Packing、SVE 后处理）与 V10x 完全一致，仅把调度层改为单个 `kupl_parallel_for(STATIC)`。为保证只用一次并行启动，把 Q Pack 移入 Page 工作线程：每个线程先打包自己 Page 区间所覆盖的 batch 的 Q，再处理这些 Page；区间边界的 batch 由相邻两个线程重复打包，写入值完全相同，且每个线程只读取自己打包过的行，因此无需任何全局 barrier。对应实现为 `kupl_mqa_logits.h`。
+
+```text
+kupl_parallel_for(STATIC) [0, total_pages)
+        ↓
+每个 worker：打包本区间覆盖的 Q → 逐 Page（K Pack → SME 2×2 → 后处理）
+```
+
+#### 3.13.3 实测结果
+
+多轮同机测试的稳定结果为：
+
+| 测试用例 | V10x 原版 | KUPL 调用层 | 相对变化 |
+|---|---:|---:|---:|
+| Case 1 | 9.2 TFLOPS | 8.8 TFLOPS | -4.3% |
+| Case 2 | 10.4 TFLOPS | 10.3 TFLOPS | ~-1% |
+
+Case 2 几乎不变，Case 1 反而小幅下降。
+
+#### 3.13.4 未采纳原因
+
+1. **Case 2 本就是带宽受限**：`next_n=1` 时算术强度固定为 64 FLOP/Byte，13.2 TFLOPS 的 K 带宽 roof 已约占 78%，调度层没有可优化空间，实测持平符合预期。
+2. **Case 1 的 Q Pack 边界冗余**：Case 1 的 Q Pack 约占 Phase Timing 的 14%，合并式调度使边界 batch 被两个线程重复打包，打包量放大到约 1.5~2 倍，新增成本超过了省下的约 4 μs 全局 barrier 与启动开销。
+
+因此调度层不是该算子的剩余瓶颈，该优化未接入正式版本。
+
+#### 3.13.5 结论
+
+KUPL 调用层替换为中性偏负收益。正式版本继续使用 V10x 框架（`indexer_mqa_logits.h`）；`kupl_mqa_logits.h` 作为参考保留，具有回退保护且结果正确。
+
 ## 4. 阶段性总结
 
 ### 4.1 性能演进

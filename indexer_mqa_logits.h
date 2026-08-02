@@ -37,7 +37,7 @@ extern "C" void pac_sme_page_scores(
     float *scores, int64_t token_tiles);
 extern "C" void pac_sme_page_scores_2x2(
     const bfloat16_t *packed_q, const bfloat16_t *packed_k,
-    float *scores);
+    float *scores, const bfloat16_t *next_k = nullptr);
 extern "C" void pac_sme_pack_k_page(
     const bfloat16_t *source, bfloat16_t *packed);
 extern "C" void pac_sme_pack_k_page_and_scores(
@@ -45,7 +45,7 @@ extern "C" void pac_sme_pack_k_page_and_scores(
     const bfloat16_t *packed_q, float *scores, int64_t token_tiles);
 extern "C" void pac_sme_pack_k_page_and_scores_2x2(
     const bfloat16_t *source, bfloat16_t *packed,
-    const bfloat16_t *packed_q, float *scores);
+    const bfloat16_t *packed_q, float *scores, const bfloat16_t *next_k = nullptr);
 
 asm(R"(
     .arch armv9-a+sme+sve2
@@ -118,11 +118,16 @@ pac_sme_page_scores:
     .global pac_sme_page_scores_2x2
     .type pac_sme_page_scores_2x2, %function
 pac_sme_page_scores_2x2:
-    sub sp, sp, #64
+    sub sp, sp, #80
     stp d8, d9, [sp, #0]
     stp d10, d11, [sp, #16]
     stp d12, d13, [sp, #32]
     stp d14, d15, [sp, #48]
+    str x19, [sp, #64]
+    mov x19, x3            // next_k（第4参数，可为 0）
+    cbnz x19, .Lpac_scores_pf_ok
+    mov x19, x1            // 无下页：预取当前 packed_k，命中缓存的安全 no-op
+.Lpac_scores_pf_ok:
     smstart
 
 .Lpac_scores_2x2_streaming:
@@ -156,6 +161,8 @@ pac_sme_page_scores_2x2:
     add x4, x4, #256
     add x5, x5, #64
     add x6, x6, #64
+    prfm pldl2keep, [x19]   // 预取下页原始 K（路线A：SME 计算期间利用空闲 DRAM）
+    add x19, x19, #64
     subs x7, x7, #1
     b.ne .Lpac_scores_2x2_k
 
@@ -188,10 +195,12 @@ pac_sme_page_scores_2x2:
     b.ne .Lpac_scores_2x2_heads
 
     smstop
-    ldp d8, d9, [sp], #16
-    ldp d10, d11, [sp], #16
-    ldp d12, d13, [sp], #16
-    ldp d14, d15, [sp], #16
+    ldp d8, d9, [sp, #0]
+    ldp d10, d11, [sp, #16]
+    ldp d12, d13, [sp, #32]
+    ldp d14, d15, [sp, #48]
+    ldr x19, [sp, #64]
+    add sp, sp, #80
     ret
     .size pac_sme_page_scores_2x2, .-pac_sme_page_scores_2x2
 
@@ -282,13 +291,18 @@ pac_sme_pack_k_page_and_scores:
     .global pac_sme_pack_k_page_and_scores_2x2
     .type pac_sme_pack_k_page_and_scores_2x2, %function
 pac_sme_pack_k_page_and_scores_2x2:
-    sub sp, sp, #64
+    sub sp, sp, #80
     stp d8, d9, [sp, #0]
     stp d10, d11, [sp, #16]
     stp d12, d13, [sp, #32]
     stp d14, d15, [sp, #48]
+    str x19, [sp, #64]
     mov x13, x2
     mov x14, x3
+    mov x19, x4            // next_k（第5参数；pack 会破坏 x4，先保存）
+    cbnz x19, .Lpac_pack_pf_ok
+    mov x19, x1            // 无下页：预取当前 packed 目标，命中缓存的安全 no-op
+.Lpac_pack_pf_ok:
     smstart
     adr x10, .Lpac_pack_and_scores_2x2_done
     b .Lpac_pack_streaming
@@ -483,6 +497,23 @@ inline void indexer_bf16_paged_mqa_logits(
             const bfloat16_t *k_page =
                 kv_ptr + physical_block * block_size * dim;
 
+            // 下页原始 K 地址：在 SME 计算期间预取，把 DRAM 读隐藏到矩阵单元计算下。
+            // 无下页或下页为负块时传 nullptr，asm 内回退为预取 packed 目标（no-op）。
+            const bfloat16_t *next_k = nullptr;
+            if (page_index + 1 < page_end) {
+                int64_t nb = batch_idx;
+                int64_t lb = logical_block + 1;
+                while (nb < batch_size &&
+                       lb >= page_offsets[nb + 1] - page_offsets[nb]) {
+                    ++nb;
+                    lb = 0;
+                }
+                const int64_t npb = block_table_ptr[nb * max_num_blocks + lb];
+                if (npb >= 0) {
+                    next_k = kv_ptr + npb * block_size * dim;
+                }
+            }
+
 #ifdef EN_TIMING
             _t_phase = get_clock_us();
             pac_sme_pack_k_page(k_page, packed_k);
@@ -507,7 +538,7 @@ inline void indexer_bf16_paged_mqa_logits(
                 _t_phase = get_clock_us();
                 if (valid_tokens == 64) {
                     pac_sme_page_scores_2x2(
-                        packed_q, packed_k, page_scores);
+                        packed_q, packed_k, page_scores, next_k);
                 } else {
                     pac_sme_page_scores(
                         packed_q, packed_k, page_scores, token_tiles);
@@ -518,7 +549,7 @@ inline void indexer_bf16_paged_mqa_logits(
                 if (!packed_k_ready) {
                     if (valid_tokens == 64) {
                         pac_sme_pack_k_page_and_scores_2x2(
-                            k_page, packed_k, packed_q, page_scores);
+                            k_page, packed_k, packed_q, page_scores, next_k);
                     } else {
                         pac_sme_pack_k_page_and_scores(
                             k_page, packed_k, packed_q,
@@ -528,7 +559,7 @@ inline void indexer_bf16_paged_mqa_logits(
                 } else {
                     if (valid_tokens == 64) {
                         pac_sme_page_scores_2x2(
-                            packed_q, packed_k, page_scores);
+                            packed_q, packed_k, page_scores, next_k);
                     } else {
                         pac_sme_page_scores(
                             packed_q, packed_k,

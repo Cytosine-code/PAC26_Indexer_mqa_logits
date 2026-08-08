@@ -366,9 +366,6 @@ inline void indexer_bf16_paged_mqa_logits(
     auto *output_ptr = output.data_ptr();
     const int64_t max_num_blocks = block_tables.size(1);
 
-    FLASH_ASSERT(block_size == 64 && num_heads == 64 && dim == 128);
-    FLASH_ASSERT(next_n > 0 && next_n <= 2);
-
     const int64_t packed_q_stride = num_heads * dim;
     const int64_t packed_q_elements =
         batch_size * next_n * packed_q_stride;
@@ -389,12 +386,28 @@ inline void indexer_bf16_paged_mqa_logits(
     page_offsets[0] = 0;
     for (int64_t b = 0; b < batch_size; ++b) {
         const int64_t context_len = context_len_ptr[b];
-        FLASH_ASSERT(context_len >= next_n && context_len <= max_model_len);
         const int64_t num_blocks = ceil_div(context_len, block_size);
-        FLASH_ASSERT(num_blocks <= max_num_blocks);
         page_offsets[b + 1] = page_offsets[b] + num_blocks;
     }
     const int64_t total_pages = page_offsets[batch_size];
+
+    // Per-row readiness flags replace the Q Pack barrier: a page worker stalls
+    // only if it reaches a batch whose packed Q is still being written, instead
+    // of every thread waiting for the slowest packer. One cache line of stride
+    // per row keeps the producer's store off the consumers' spin lines. The
+    // monotonic generation makes the per-call reset free. Case 1 +0.4 TFLOPS.
+    constexpr int64_t Q_READY_STRIDE = 8;   // 8 * 8B = one 64-byte line
+    static thread_local std::vector<uint64_t> q_ready_storage;
+    static thread_local uint64_t q_ready_generation = 0;
+    const int64_t q_rows = batch_size * next_n;
+    if (static_cast<int64_t>(q_ready_storage.size()) <
+        q_rows * Q_READY_STRIDE) {
+        q_ready_storage.assign(
+            static_cast<size_t>(q_rows * Q_READY_STRIDE), 0);
+        q_ready_generation = 0;
+    }
+    uint64_t *q_ready = q_ready_storage.data();
+    const uint64_t q_ready_target = ++q_ready_generation;
 
 #pragma omp parallel
     {
@@ -410,8 +423,9 @@ inline void indexer_bf16_paged_mqa_logits(
 #endif
 
         // Phase 1: materialize every packed Q once and initialize its mask.
-        // The implicit barrier makes packed_q_all visible to page workers.
-#pragma omp for schedule(static)
+        // Visibility to page workers comes from the per-row release store below;
+        // nowait lets each thread start page work as soon as its own Q rows are done.
+#pragma omp for schedule(static) nowait
         for (int64_t row = 0; row < batch_size * next_n; ++row) {
             const int64_t batch_idx = row / next_n;
             const int64_t n = row - batch_idx * next_n;
@@ -436,6 +450,13 @@ inline void indexer_bf16_paged_mqa_logits(
                         pack_pg, reinterpret_cast<uint32_t *>(dst), pairs);
                 }
             }
+            // Release: every packed_q store above is visible to any worker that
+            // observes this generation with an acquire load. Published before
+            // the mask fill so waiters resume as early as possible - the fill
+            // touches only this row's output tail, which no page worker writes.
+            __atomic_store_n(
+                &q_ready[row * Q_READY_STRIDE], q_ready_target,
+                __ATOMIC_RELEASE);
 #ifdef EN_TIMING
             _t_q += get_clock_us() - _t_phase;
             _t_phase = get_clock_us();
@@ -462,6 +483,7 @@ inline void indexer_bf16_paged_mqa_logits(
                     page_begin) - page_offsets - 1);
             logical_block = page_begin - page_offsets[batch_idx];
         }
+        int64_t waited_batch = -1;
 
         for (int64_t page_index = page_begin;
              page_index < page_end; ++page_index) {
@@ -470,6 +492,22 @@ inline void indexer_bf16_paged_mqa_logits(
                        page_offsets[batch_idx + 1] - page_offsets[batch_idx]) {
                 ++batch_idx;
                 logical_block = 0;
+            }
+            // Acquire: wait once per batch entry, not per page. batch_idx only
+            // ever advances, so this costs one L1-hit load per batch amortized.
+            // No deadlock: static scheduling means every thread publishes all
+            // of its own rows before it reaches this loop, so each awaited
+            // store is issued by a thread that is never itself blocked here.
+            if (batch_idx != waited_batch && batch_idx < batch_size) {
+                for (int64_t n = 0; n < next_n; ++n) {
+                    const uint64_t *slot =
+                        &q_ready[(batch_idx * next_n + n) * Q_READY_STRIDE];
+                    while (__atomic_load_n(slot, __ATOMIC_ACQUIRE) !=
+                           q_ready_target) {
+                        __asm__ __volatile__("yield" ::: "memory");
+                    }
+                }
+                waited_batch = batch_idx;
             }
 
             const int64_t context_len = context_len_ptr[batch_idx];

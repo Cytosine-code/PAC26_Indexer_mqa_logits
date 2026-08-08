@@ -22,16 +22,8 @@ LX2芯片，详细请参考目录下SVEconfig.md，只能使用单numa节点38�
 
 ### 本地开发
 
-- `bash test.sh` — x86 WSL 编译运行（纯 C++ ref，调试算法逻辑）
+- `bash test.sh` — x86 WSL 编译运行，本地无需执行，只做静态检查
 - 远程 ARM：`g++ -O3 -march=armv9-a+sme+sve2 -fopenmp -lnuma main.cpp -o main`
 - `#ifdef __aarch64__` 隔离 ARM/x86 路径，本地用 `-I./x86_compat`
 
 - 远程项目与本项目唯一区别是远端失误写成probe/本地是probes
-
-### 赛题记忆
-
-为防止你忘掉上下文如环境等配置，可以参考以下内容：
-
-- probes/ 下保存了历史的探针
-- SVEconfig.md 保存了远程计算环境的配置
-- PAC2026_indexer_maq_logits_优化报告.md 记录了我们历史的优化

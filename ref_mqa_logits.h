@@ -8,6 +8,7 @@
 #include <string>
 #include <sstream>
 #include <cmath>
+#include <arm_sme.h>
 #include <omp.h>
 
 #include "Tensor.h"

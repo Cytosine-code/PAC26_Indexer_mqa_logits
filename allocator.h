@@ -1,6 +1,8 @@
 #pragma once
 
 #include <sys/mman.h>
+#include <numa.h>
+#include <numaif.h>
 #include <unistd.h>
 #include <iostream>
 
@@ -9,10 +11,6 @@
 constexpr int64_t DEFAULT_ALIGNMENT = 64;
 
 const int64_t PAGE_SIZE = sysconf(_SC_PAGESIZE);
-
-#ifdef __aarch64__
-#include <numa.h>
-#include <numaif.h>
 
 inline void *mmap_on_package_memory(int64_t size)
 {
@@ -25,18 +23,6 @@ inline void *mmap_on_package_memory(int64_t size)
     mbind(addr, size, MPOL_BIND, &mask, sizeof(mask) * 8, MPOL_MF_STRICT | MPOL_MF_MOVE);
     return addr;
 }
-
-#else
-
-inline void *mmap_on_package_memory(int64_t size)
-{
-    FLASH_ASSERT(size % PAGE_SIZE == 0);
-    void *addr = mmap(NULL, size, PROT_READ | PROT_WRITE,
-                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
-    return addr;
-}
-
-#endif
 
 struct Allocator {
     void *begin_addr;

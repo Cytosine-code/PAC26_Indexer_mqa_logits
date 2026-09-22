@@ -1,16 +1,39 @@
-# PAC 2026 — indexer_mqa_logits
+# PAC 2026 — Indexer_mqa_logits
 
 
 
-鲲鹏（AArch64）平台上 `indexer_bf16_paged_mqa_logits` 算子的 SME/SVE 优化实现。
+鲲鹏（AArch64）平台上对 **DeepSeek V4 CSA 压缩稀疏注意力** 核心打分算子 `indexer_bf16_paged_mqa_logits` 的 SME/SVE 优化实现。
 
-赛题要求：在**只允许修改 `indexer_mqa_logits.h`** 的前提下，用 BF16 分页 KV Cache 完成
-Query × KV 点积、ReLU、Head 加权归约并写出 Logits，按 **TFLOPS** 评分，精度门槛
-`cos_diff < 5e-6`。
+要求：在**只允许修改 `indexer_mqa_logits.h`** 的前提下，用 BF16 分页 KV Cache 完成 Query × KV 点积、ReLU、Head 加权归约并写出 Logits，按 **TFLOPS** 评分，精度门槛 `cos_diff < 5e-6`。
 
 
 
-## 结果
+## 赛题内容
+
+**输入**
+
+- B：batch_size，N：next_n（并行 query 数量），H：num_heads，D：head_dim
+- $\boldsymbol{Q}_{b,n,h} \in \mathbb{R}^{D}$：第b批、第n个新 token、第h查询头的 Query 向量
+- $\boldsymbol{K}_{b,t} \in \mathbb{R}^{D}$：第b批序列中第t个历史 token 的 Key 向量（MQA：所有头共享同一套 K）
+- $w_{b,n,h} \in \mathbb{R}$：对应头可学习权重
+- $\boldsymbol{O}_{b,n,t}$：算子输出，第b批、第n个 query 对历史位置t的综合相似度 logit
+- $\tau_{b,n}$：因果上限位置；满足 $t>\tau_{b,n}$ 或 $t\ge L_b$（有效上下文长度）时屏蔽为 $-\infty$
+
+**计算公式**
+
+$$
+\boldsymbol{O}_{b,n,t} =
+\begin{cases}
+\displaystyle \sum_{h=1}^{H} w_{b,n,h}\cdot \max\big(0, \boldsymbol{Q}_{b,n,h}^\top \boldsymbol{K}_{b,t}\big)
+& t \le \tau_{b,n} \land t < L_b \\
+-\infty & \text{otherwise}
+\end{cases}
+$$
+
+
+
+
+## 优化效果
 
 | 测试用例 | Baseline | 最终版本 | 加速比 | 耗时 |
 |---|---:|---:|---:|---:|
